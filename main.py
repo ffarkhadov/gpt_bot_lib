@@ -15,7 +15,7 @@ async def main():
     # Новый хэндлер — /start
     @dp.message(F.text == "/start")
     async def start_handler(message: types.Message):
-        await message.answer("👋 Привет! Я бот SIMPATEA. Напиши мне что-нибудь!")
+        await message.answer("👋 Привет! Я бот SIMPATEA. Напиши мне!")
 
     # Старый echo-хэндлер
     @dp.message()
