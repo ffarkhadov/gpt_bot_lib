@@ -63,7 +63,9 @@ async def save_sheet_id(msg: Message, state: FSMContext):
     await state.set_state(AddStore.confirm_access)
 
 
-@router.message(AddStore.confirm_access, F.text.lower().in_("готово", "done"))
+
+@router.message(AddStore.confirm_access, F.text.lower().in_(["готово", "done"]))
+
 async def finish_add(msg: Message, state: FSMContext):
     cfg = await state.get_data()
     # сериализуем ключи
