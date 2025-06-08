@@ -1,0 +1,26 @@
+name: Deploy SIMPATEA Bot to VPS
+
+on:
+  push:
+    branches:
+      - master  # ← замени, если ветка называется иначе
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Deploy via SSH to VPS
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd /root/telegram_bots/simpatea_mp_bot
+            git pull origin main
+            /root/telegram_bots/simpatea_mp_bot/venv/bin/pip install -r requirements.txt
+            sudo systemctl restart simpatea_mp_bot.service
