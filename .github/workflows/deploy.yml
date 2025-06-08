@@ -21,6 +21,6 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd /root/telegram_bots/simpatea_mp_bot
-            git pull origin main
+            git pull origin master
             /root/telegram_bots/simpatea_mp_bot/venv/bin/pip install -r requirements.txt
             sudo systemctl restart simpatea_mp_bot.service
