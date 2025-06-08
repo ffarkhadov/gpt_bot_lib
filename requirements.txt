@@ -1,1 +1,26 @@
-ÿþ# Project requirements
+cachetools==5.5.2
+certifi==2025.4.26
+charset-normalizer==3.4.2
+credentials==1.1
+DateTime==5.5
+google-auth==2.40.3
+google-auth-oauthlib==1.2.2
+gspread==6.2.1
+gspread-formatting==1.2.1
+idna==3.10
+numpy==2.2.6
+oauthlib==3.2.2
+pandas==2.3.0
+pyasn1==0.6.1
+pyasn1_modules==0.4.2
+python-dateutil==2.9.0.post0
+pytz==2025.2
+requests==2.32.3
+requests-oauthlib==2.0.0
+rsa==4.9.1
+setuptools==80.9.0
+six==1.17.0
+tz==0.2.2
+tzdata==2025.2
+urllib3==2.4.0
+zope.interface==7.2
