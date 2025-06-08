@@ -1,5 +1,5 @@
 import asyncio
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -12,6 +12,12 @@ async def main():
     )
     dp = Dispatcher()
 
+    # Новый хэндлер — /start
+    @dp.message(F.text == "/start")
+    async def start_handler(message: types.Message):
+        await message.answer("👋 Привет! Я бот SIMPATEA. Напиши мне что-нибудь!")
+
+    # Старый echo-хэндлер
     @dp.message()
     async def echo_handler(message: types.Message):
         await message.answer(f"Вы сказали: {message.text}")
@@ -20,4 +26,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
