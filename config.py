@@ -1,5 +1,6 @@
 from pathlib import Path
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -12,5 +13,5 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
+settings = Settings()
 
-settings = Settings()  # ← импортируется всеми модулями

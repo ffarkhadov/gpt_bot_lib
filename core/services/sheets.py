@@ -1,5 +1,4 @@
-import functools
-import time
+import asyncio
 from typing import Any
 
 import gspread
@@ -12,10 +11,10 @@ def _retry(func):
         for delay in (*BACKOFF, None):
             try:
                 return await func(*args, **kwargs)
-            except Exception as e:
+            except Exception:
                 if delay is None:
                     raise
-                time.sleep(delay)
+                await asyncio.sleep(delay)
     return wrapper
 
 
