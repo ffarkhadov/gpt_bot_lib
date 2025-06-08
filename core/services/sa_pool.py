@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from typing import Tuple
 
@@ -14,6 +15,7 @@ async def pick_service_account(sheets: SheetsClient) -> Tuple[str, str]:
     """
     ws = await sheets.get_worksheet(TECH_SHEET_ID, SA_WORKSHEET)
     rows = (await sheets.read_all(ws))[1:]  # без заголовка
+
     idx_min, min_val = None, 1e9
     for idx, row in enumerate(rows, start=2):  # учёт заголовка
         status = row[4]
