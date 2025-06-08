@@ -1,28 +1,28 @@
 import asyncio
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+import logging
 
-TOKEN = "7570856507:AAHAZX7bm7zk8otWg50ad9EHxbYA1QEOV68"
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
 
-async def main():
-    bot = Bot(
-        token=TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    dp = Dispatcher()
+from config import settings
+from telegram.handlers import router as handlers_router
+from core.tasks.queue import start_workers
 
-    # Новый хэндлер — /start
-    @dp.message(F.text == "/start")
-    async def start_handler(message: types.Message):
-        await message.answer("👋 Привет! Я бот SIMPATEA. Напиши мне!")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
-    # Старый echo-хэндлер
-    @dp.message()
-    async def echo_handler(message: types.Message):
-        await message.answer(f"Вы сказали: {message.text}")
+async def main() -> None:
+    bot = Bot(settings.BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(handlers_router)
+
+    # запускаем фоновые workers
+    worker_pool = asyncio.create_task(start_workers(settings.WORKERS))
 
     await dp.start_polling(bot)
+    await worker_pool  # не даём python завершиться
 
 if __name__ == "__main__":
     asyncio.run(main())
