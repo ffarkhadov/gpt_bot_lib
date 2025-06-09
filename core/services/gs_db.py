@@ -7,6 +7,21 @@ from config import settings
 
 TECH_SHEET = settings.TECH_SHEET_ID
 
+-from core.services.sheets import SheetsClient
++from core.services.sheets import SheetsClient
++from core.services.sa_cache import sa_cache
+@@
+-    async def pick_service_account(self) -> dict[str, str]:
+-        ...
++    async def pick_service_account(self) -> dict[str, str]:
++        """
++        Берём из RAM-кэша; запись used_count делается там же.
++        """
++        sa = await sa_cache.pick()
++        if not sa:
++            raise RuntimeError("Нет доступных сервис-аккаунтов")
++        return sa
+
 
 class GsDB:
     """
