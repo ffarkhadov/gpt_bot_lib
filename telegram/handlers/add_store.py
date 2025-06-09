@@ -3,8 +3,9 @@ from __future__ import annotations
 from json import dumps
 from uuid import uuid4
 import logging
+import asyncio  # нужен для create_task
 
-from aiogram import Router, F
+from aiogram import Router, F, Bot  # Bot — новый импорт!
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 
@@ -106,29 +107,43 @@ async def cancel(cb: CallbackQuery, state: FSMContext):
 async def save(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     db = GsDB()
+    bot: Bot = cb.bot
 
-    store_id = data.get("client_id") or str(uuid4())
-    await db.add_store(
-        store_id=store_id,
-        owner_id=cb.from_user.id,
-        marketplace=data["mp"],
-        name=f"{data['mp'].upper()}-{store_id[:6]}",
-        credentials_json=dumps({
-            "client_id": data.get("client_id"),
-            "api_key": data["api_key"],
-        }),
-        sheet_id=data["sheet_id"],
-        sa_path=data["sa_path"],                 # ← KEY
-    )
-
-    await cb.message.edit_text("✅ Магазин сохранён. Возвращаюсь в меню.")
-    await state.clear()
-
-    stores = await db.get_stores_by_owner(cb.from_user.id)
-    await cb.message.answer(
-        "Главное меню:",
-        reply_markup=kb_main(
-            [(s["store_id"], s["name"], s["marketplace"]) for s in stores]
-        ),
-    )
+    # моментальный отклик пользователю: убираем кнопки и показываем "секунду"
+    await cb.message.edit_reply_markup()
+    await cb.message.answer("⏳ Сохраняю магазин, секунду…")
     await cb.answer()
+
+    async def _background():
+        try:
+            store_id = data.get("client_id") or str(uuid4())
+            await db.add_store(
+                store_id=store_id,
+                owner_id=cb.from_user.id,
+                marketplace=data["mp"],
+                name=f"{data['mp'].upper()}-{store_id[:6]}",
+                credentials_json=dumps({
+                    "client_id": data.get("client_id"),
+                    "api_key": data["api_key"],
+                }),
+                sheet_id=data["sheet_id"],
+                sa_path=data["sa_path"],
+            )
+
+            stores = await db.get_stores_by_owner(cb.from_user.id)
+            await bot.send_message(
+                cb.from_user.id,
+                "✅ Магазин сохранён. Главное меню:",
+                reply_markup=kb_main(
+                    [(s["store_id"], s["name"], s["marketplace"]) for s in stores]
+                ),
+            )
+        except Exception as e:
+            await bot.send_message(
+                cb.from_user.id,
+                f"❌ Не удалось сохранить магазин: {e}",
+            )
+        finally:
+            await state.clear()
+
+    asyncio.create_task(_background())
