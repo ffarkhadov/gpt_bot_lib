@@ -13,6 +13,8 @@ from telegram.states import AddStore
 from telegram.keyboards import kb_step, kb_main, kb_confirm
 from core.services.gs_db import GsDB
 
+from telegram.handlers.start import cmd_start  # <-- импортируй cmd_start
+
 log = logging.getLogger(__name__)
 router = Router(name="add_store")
 
@@ -101,8 +103,8 @@ async def cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🚫 Подключение прервано.")
     await cb.answer()
 
-    # Отправляем /start — эффект как будто пользователь только что запустил бота
-    await cb.message.answer("/start")
+    # Показываем главное меню напрямую:
+    await cmd_start(cb.message, cb.bot)
 
 
 # ───────────── сохранение ─────────────
