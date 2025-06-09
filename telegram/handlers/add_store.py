@@ -6,7 +6,6 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 
 from telegram.states import AddStore
-from telegram.keyboards import kb_step
 from core.services.gs_db import GsDB
 from core.services.ozon_api import OzonAPI
 from core.services.wb_api import WBAPI
@@ -22,7 +21,6 @@ async def add_store_intro(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(
         "<b>Подключение магазина</b>\n"
         "Всего 3 шага: ключи → таблица → подтверждение.\nНажмите «Далее».",
-        reply_markup=kb_step("step1"),
     )
     await cb.answer()
 
