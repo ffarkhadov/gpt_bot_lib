@@ -62,5 +62,5 @@ class GsDB:
         path, email, used = row[0], row[3], int(row[2])
 
         # +1 к used_count
-        ws.update(f"C{idx_row}", str(used + 1))
+        ws.update(f"C{idx_row}", [[used + 1]])
         return {"path": path, "email": email}
