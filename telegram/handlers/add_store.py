@@ -11,20 +11,17 @@ from aiogram.fsm.context import FSMContext
 from telegram.states import AddStore
 from telegram.keyboards import kb_step, kb_main
 from core.services.gs_db import GsDB
-from core.services.ozon_api import OzonAPI
-from core.services.wb_api import WBAPI
 
 log = logging.getLogger(__name__)
 router = Router(name="add_store")
 
 
 # ─────────────────────────────────────────────────────────────
-#  старт регистрации (кнопки «➕ Добавить …»)
+#  «➕ Добавить Ozon / WB магазин»
 # ─────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "add_ozon")
 @router.callback_query(F.data == "add_wb")
 async def add_store_intro(cb: CallbackQuery, state: FSMContext):
-    log.info("Got CB: %s", cb.data)     # в журнале увидите коллбэк
     mp = "ozon" if cb.data == "add_ozon" else "wb"
     await state.update_data(mp=mp)
 
@@ -32,17 +29,16 @@ async def add_store_intro(cb: CallbackQuery, state: FSMContext):
         "<b>Подключение магазина</b>\n"
         "Всего 3 шага: ключи → таблица → подтверждение.\n"
         "Нажмите «Далее».",
-        reply_markup=kb_step("step1"),   # ← клавиатура!
+        reply_markup=kb_step("step1"),
     )
     await cb.answer()
 
 
 # ─────────────────────────────────────────────────────────────
-# «Далее» → начинаем спрашивать ключи
+# «Далее» → спрашиваем Client-ID (Ozon) или API-Key (WB)
 # ─────────────────────────────────────────────────────────────
 @router.callback_query(F.data == "step1")
 async def ask_first_key(cb: CallbackQuery, state: FSMContext):
-    log.info("Got CB: %s", cb.data)
     data = await state.get_data()
     if data["mp"] == "ozon":
         await cb.message.answer("Введите <b>Client-ID</b> Ozon:")
@@ -54,7 +50,7 @@ async def ask_first_key(cb: CallbackQuery, state: FSMContext):
 
 
 # ─────────────────────────────────────────────────────────────
-# Client-ID  →  дальше API-Key
+# Client-ID (Ozon) → дальше API-Key
 # ─────────────────────────────────────────────────────────────
 @router.message(AddStore.client_id)
 async def save_client_id(msg: Message, state: FSMContext):
@@ -64,22 +60,11 @@ async def save_client_id(msg: Message, state: FSMContext):
 
 
 # ─────────────────────────────────────────────────────────────
-# API-Key  →  проверка → sheet_id
+# API-Key получен  →  сразу спрашиваем ID таблицы (без проверки)
 # ─────────────────────────────────────────────────────────────
 @router.message(AddStore.api_key)
 async def save_api_key(msg: Message, state: FSMContext):
     await state.update_data(api_key=msg.text.strip())
-
-    data = await state.get_data()
-    ok = False
-    if data["mp"] == "ozon":
-        ok = await OzonAPI(data["client_id"], data["api_key"]).ping()
-    else:
-        ok = await WBAPI(data["api_key"]).ping()
-
-    if not ok:
-        await msg.answer("❌ Ключи не прошли проверку. Попробуйте ещё раз.")
-        return
 
     await msg.answer(
         "Укажите <b>ID Google-таблицы</b> "
@@ -89,19 +74,17 @@ async def save_api_key(msg: Message, state: FSMContext):
 
 
 # ─────────────────────────────────────────────────────────────
-# Sheet ID  →  подтверждение
+# Sheet ID  →  подтверждение «Готово»
 # ─────────────────────────────────────────────────────────────
 @router.message(AddStore.sheet_id)
 async def save_sheet(msg: Message, state: FSMContext):
     await state.update_data(sheet_id=msg.text.strip())
-    await msg.answer(
-        "Проверьте данные и напишите «Готово», если всё верно."
-    )
+    await msg.answer("Проверьте данные и напишите «Готово», если всё верно.")
     await state.set_state(AddStore.confirm)
 
 
 # ─────────────────────────────────────────────────────────────
-# Финал: записываем магазин, обновляем меню
+# Завершаем: пишем в тех-таблицу и возвращаем меню
 # ─────────────────────────────────────────────────────────────
 @router.message(AddStore.confirm, F.text.lower().in_({"готово", "done"}))
 async def finish(msg: Message, state: FSMContext):
@@ -124,6 +107,7 @@ async def finish(msg: Message, state: FSMContext):
     await msg.answer("✅ Магазин сохранён. Возвращаюсь в меню.")
     await state.clear()
 
+    # Обновлённое меню
     stores = await db.get_stores_by_owner(msg.from_user.id)
     await msg.answer(
         "Главное меню:",
