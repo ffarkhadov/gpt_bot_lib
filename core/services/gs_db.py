@@ -22,7 +22,7 @@ class GsDB:
     async def ensure_user(self, tg_id: int, username: str | None,
                           full_name: str | None):
         ws = await self._ws("Users")
-        rows = await self.sheets.read_all(ws)[1:]          # без заголовка
+        rows = (await self.sheets.read_all(ws))[1:] # без заголовка
         ids = [r[0] for r in rows]
         if str(tg_id) in ids:
             return  # уже есть
