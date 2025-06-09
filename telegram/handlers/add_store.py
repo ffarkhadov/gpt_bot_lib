@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
 from json import dumps
 from uuid import uuid4
+import logging
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
@@ -17,25 +17,24 @@ router = Router(name="add_store")
 
 
 def _mask(token: str) -> str:
-    """102e••••••6ce11d — показываем первые/последние 4 символа."""
     return token[:4] + "•" * max(0, len(token) - 8) + token[-4:]
 
 
-# ───────────────────────── Старт ─────────────────────────
+# ───────────── старт ─────────────
 @router.callback_query(F.data.in_({"add_ozon", "add_wb"}))
 async def add_store_intro(cb: CallbackQuery, state: FSMContext):
     mp = "ozon" if cb.data == "add_ozon" else "wb"
     await state.update_data(mp=mp)
     await cb.message.answer(
         "<b>Подключение магазина</b>\n"
-        "Всего 3 шага: ключи → таблица → подтверждение.\n"
+        "Всего 3 шага: ключи → таблица → сервисный аккаунт.\n"
         "Нажмите «Далее».",
         reply_markup=kb_step("step1"),
     )
     await cb.answer()
 
 
-# ─────────────────── Шаг 1: ключи ───────────────────
+# ───────────── ключи ─────────────
 @router.callback_query(F.data == "step1")
 async def ask_first_key(cb: CallbackQuery, state: FSMContext):
     mp = (await state.get_data())["mp"]
@@ -65,12 +64,17 @@ async def save_api(msg: Message, state: FSMContext):
     await state.set_state(AddStore.sheet_id)
 
 
-# ──────────────── Шаг 2: Sheet ID → подтверждение ────────────────
+# ───────────── выбор SA и подтверждение ─────────────
 @router.message(AddStore.sheet_id)
 async def confirm_data(msg: Message, state: FSMContext):
     await state.update_data(sheet_id=msg.text.strip())
-    d = await state.get_data()
 
+    # выбираем сервис-аккаунт
+    db = GsDB()
+    sa = await db.pick_service_account()
+    await state.update_data(sa_path=sa["path"], sa_email=sa["email"])
+
+    d = await state.get_data()
     text = (
         "<b>Проверьте введённые данные:</b>\n"
         f"Маркетплейс: <code>{d['mp'].upper()}</code>\n"
@@ -80,14 +84,16 @@ async def confirm_data(msg: Message, state: FSMContext):
     text += (
         f"API-Key: <code>{_mask(d['api_key'])}</code>\n"
         f"Sheet ID: <code>{d['sheet_id']}</code>\n\n"
-        "Нажмите «✅ Сохранить магазин» или «❌ Отмена»."
+        f"<b>Сервисный аккаунт:</b> <code>{d['sa_email']}</code>\n"
+        "Добавьте этот email в доступ к таблице (роль «Редактор»):\n"
+        "Файл → Настройки доступа → Добавить пользователи → вставьте email.\n\n"
+        "Затем нажмите «✅ Сохранить магазин»."
     )
-
     await msg.answer(text, reply_markup=kb_confirm())
     await state.set_state(AddStore.confirm)
 
 
-# ──────────── Кнопка «Отмена» ────────────
+# ───────────── отмена ─────────────
 @router.callback_query(F.data == "cancel_store")
 async def cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -95,29 +101,29 @@ async def cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ──────────── Кнопка «Сохранить магазин» ────────────
+# ───────────── сохранение ─────────────
 @router.callback_query(F.data == "save_store")
 async def save(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     db = GsDB()
 
     store_id = data.get("client_id") or str(uuid4())
-    creds_json = dumps(
-        {"client_id": data.get("client_id"), "api_key": data["api_key"]}
-    )
     await db.add_store(
         store_id=store_id,
         owner_id=cb.from_user.id,
         marketplace=data["mp"],
         name=f"{data['mp'].upper()}-{store_id[:6]}",
-        credentials_json=creds_json,
+        credentials_json=dumps({
+            "client_id": data.get("client_id"),
+            "api_key": data["api_key"],
+        }),
         sheet_id=data["sheet_id"],
+        sa_path=data["sa_path"],                 # ← KEY
     )
 
     await cb.message.edit_text("✅ Магазин сохранён. Возвращаюсь в меню.")
     await state.clear()
 
-    # обновляем меню
     stores = await db.get_stores_by_owner(cb.from_user.id)
     await cb.message.answer(
         "Главное меню:",
