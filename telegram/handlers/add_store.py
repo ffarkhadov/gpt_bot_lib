@@ -101,6 +101,9 @@ async def cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🚫 Подключение прервано.")
     await cb.answer()
 
+    # Отправляем /start — эффект как будто пользователь только что запустил бота
+    await cb.message.answer("/start")
+
 
 # ───────────── сохранение ─────────────
 @router.callback_query(F.data == "save_store")
