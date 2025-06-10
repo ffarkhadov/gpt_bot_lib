@@ -108,25 +108,20 @@ async def delete_ok(cb: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("unit_"))
 async def run_unit(cb: CallbackQuery):
     sid = cb.data.removeprefix("unit_")
-    db = GsDB()
-    ws = await db._ws("Stores")
-    rows = (await db.sheets.read_all(ws))[1:]
-    store_row = next((r for r in rows if r[0] == sid), None)
-    if not store_row:
-        await cb.answer("Магазин не найден", show_alert=True)
-        return
-
-    # отправляем пользователю индикатор
-    await cb.answer("⏳ Задача поставлена…")
-    await cb.message.answer("⏳ Строю отчёт, подождите…")
+    db  = GsDB()
+    rows = (await db.sheets.read_all(await db._ws("Stores")))[1:]
+    row  = next((r for r in rows if r[0] == sid), None)
+    if not row:
+        await cb.answer("Магазин не найден", show_alert=True); return
 
     cfg = {
         "store_id": sid,
-        "marketplace": store_row[2],
-        "credentials_json": store_row[4],
-        "sheet_id": store_row[5],
-        "sa_path": store_row[6],
+        "marketplace": row[2],
+        "credentials_json": row[4],
+        "sheet_id": row[5],
+        "sa_path": row[6],
         "chat_id": cb.from_user.id,
-        "menu_message_id": cb.message.message_id,
     }
+    await cb.answer("⏳ Задача поставлена…")
     await enqueue(run_report, cfg)
+
