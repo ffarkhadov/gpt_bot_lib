@@ -1,16 +1,39 @@
+"""
+core/tasks/report_runner.py
+---------------------------
+Фоновый запуск unit_day_5 с детальным логом и сообщением
+пользователю об успехе / ошибке.
+
+store_cfg =
+{
+  store_id, marketplace,
+  credentials_json,   # '{"client_id":"…","api_key":"…"}'
+  sheet_id,
+  sa_path,
+  chat_id,
+}
+"""
 from __future__ import annotations
 import asyncio, json, inspect, logging, traceback
 from functools import partial
 from importlib import import_module
+
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
 from config import settings
 
 log = logging.getLogger(__name__)
 
+
 async def run_report(cfg: dict):
-    bot = Bot(settings.BOT_TOKEN, parse_mode="HTML")
+    # ↓ правильный способ задать parse_mode
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
     chat_id = cfg["chat_id"]
 
+    # индикатор «идёт обработка»
     prog = await bot.send_message(chat_id, "⏳ Строю отчёт…")
 
     try:
@@ -32,11 +55,13 @@ async def run_report(cfg: dict):
             await loop.run_in_executor(None, partial(func, **kwargs))
 
         await bot.edit_message_text(chat_id, prog.message_id,
-                                    "✅ unit-day готов.")
+                                    "✅ Отчёт unit-day обновлён.")
         log.info("unit-day OK for %s", cfg["store_id"])
 
     except Exception:
         err = traceback.format_exc()
+        await bot.edit_message_text(
+            chat_id, prog.message_id,
+            f"❌ unit-day ERROR:\n<code>{err.splitlines()[-1]}</code>"
+        )
         log.error("unit-day FAIL for %s\n%s", cfg["store_id"], err)
-        await bot.edit_message_text(chat_id, prog.message_id,
-                                    f"❌ unit-day ERROR:\n<code>{err.splitlines()[-1]}</code>")
