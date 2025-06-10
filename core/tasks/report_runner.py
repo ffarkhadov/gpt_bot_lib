@@ -1,18 +1,3 @@
-"""
-core/tasks/report_runner.py
----------------------------
-Фоновый запуск unit_day_5 с детальным логом и сообщением
-пользователю об успехе / ошибке.
-
-store_cfg =
-{
-  store_id, marketplace,
-  credentials_json,   # '{"client_id":"…","api_key":"…"}'
-  sheet_id,
-  sa_path,
-  chat_id,
-}
-"""
 from __future__ import annotations
 import asyncio, json, inspect, logging, traceback
 from functools import partial
@@ -24,16 +9,13 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
-
 async def run_report(cfg: dict):
-    # ↓ правильный способ задать parse_mode
     bot = Bot(
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML")
     )
     chat_id = cfg["chat_id"]
 
-    # индикатор «идёт обработка»
     prog = await bot.send_message(chat_id, "⏳ Строю отчёт…")
 
     try:
@@ -54,14 +36,22 @@ async def run_report(cfg: dict):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, partial(func, **kwargs))
 
-        await bot.edit_message_text(chat_id, prog.message_id,
-                                    "✅ Отчёт unit-day обновлён.")
+        # ← именованные аргументы!
+        await bot.edit_message_text(
+            text="✅ Отчёт unit-day обновлён.",
+            chat_id=chat_id,
+            message_id=prog.message_id,
+        )
         log.info("unit-day OK for %s", cfg["store_id"])
 
     except Exception:
         err = traceback.format_exc()
         await bot.edit_message_text(
-            chat_id, prog.message_id,
-            f"❌ unit-day ERROR:\n<code>{err.splitlines()[-1]}</code>"
+            text=f"❌ unit-day ERROR:\n<code>{err.splitlines()[-1]}</code>",
+            chat_id=chat_id,
+            message_id=prog.message_id,
         )
         log.error("unit-day FAIL for %s\n%s", cfg["store_id"], err)
+
+    finally:
+        await bot.session.close()
