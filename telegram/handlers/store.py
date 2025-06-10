@@ -1,11 +1,13 @@
 from __future__ import annotations
-import asyncio, logging
+import logging, asyncio
 from aiogram import Router, F, Bot
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from telegram.keyboards import kb_store_menu, kb_del_confirm, kb_main
+from telegram.keyboards import (
+    kb_store_menu, kb_del_confirm, kb_main
+)
 from core.services.gs_db import GsDB
 from core.tasks.queue import enqueue
 from core.tasks.report_runner import run_report
@@ -13,11 +15,13 @@ from core.tasks.report_runner import run_report
 log = logging.getLogger(__name__)
 router = Router(name="store")
 
+
 # ───────────── FSM для переименования ─────────────
 class Rename(StatesGroup):
     waiting_name = State()
 
 
+# ─────────────────── открыть меню магазина ───────────────────
 @router.callback_query(F.data.startswith("store_"))
 async def open_store(cb: CallbackQuery):
     sid = cb.data.removeprefix("store_")
@@ -27,12 +31,13 @@ async def open_store(cb: CallbackQuery):
         await cb.answer("Магазин не найден", show_alert=True)
         return
     await cb.message.edit_text(
-        f"<b>Меню магазина</b> <code>{sid}</code>",
+        f"<b>Меню магазина</b>  <code>{sid}</code>",
         reply_markup=kb_store_menu(sid),
     )
     await cb.answer()
 
-# ─── Переименование ───
+
+# ─────────────────── переименование ───────────────────
 @router.callback_query(F.data.startswith("rename_"))
 async def rename_ask(cb: CallbackQuery, state: FSMContext):
     sid = cb.data.removeprefix("rename_")
@@ -55,12 +60,14 @@ async def rename_save(msg: Message, state: FSMContext, bot: Bot):
             break
     await bot.delete_message(msg.chat.id, msg.message_id)
     await bot.edit_message_text(
-        chat_id=msg.chat.id, message_id=prev_mid,
+        chat_id=msg.chat.id,
+        message_id=prev_mid,
         text="✅ Название обновлено.",
     )
     await state.clear()
 
-# ─── Удаление ───
+
+# ─────────────────── удаление ───────────────────
 @router.callback_query(F.data.startswith("delask_"))
 async def delete_ask(cb: CallbackQuery):
     sid = cb.data.removeprefix("delask_")
@@ -96,7 +103,8 @@ async def delete_ok(cb: CallbackQuery, bot: Bot):
     )
     await cb.answer()
 
-# ─── Запуск отчёта unit-day ───
+
+# ─────────────────── запуск отчёта unit-day ───────────────────
 @router.callback_query(F.data.startswith("unit_"))
 async def run_unit(cb: CallbackQuery):
     sid = cb.data.removeprefix("unit_")
@@ -108,6 +116,10 @@ async def run_unit(cb: CallbackQuery):
         await cb.answer("Магазин не найден", show_alert=True)
         return
 
+    # отправляем пользователю индикатор
+    await cb.answer("⏳ Задача поставлена…")
+    await cb.message.answer("⏳ Строю отчёт, подождите…")
+
     cfg = {
         "store_id": sid,
         "marketplace": store_row[2],
@@ -117,6 +129,4 @@ async def run_unit(cb: CallbackQuery):
         "chat_id": cb.from_user.id,
         "menu_message_id": cb.message.message_id,
     }
-
-    await cb.answer("⏳ Задача поставлена…")
     await enqueue(run_report, cfg)
