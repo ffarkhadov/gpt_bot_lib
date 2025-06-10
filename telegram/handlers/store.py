@@ -35,6 +35,7 @@ async def open_store(cb: CallbackQuery):
     await cb.answer()
 
 
+
 # ─── Переименовать ───
 @router.callback_query(F.data.startswith("rename_"))
 async def rename_ask(cb: CallbackQuery, state: FSMContext):
@@ -122,8 +123,12 @@ async def run_unit(cb: CallbackQuery):
 
     await cb.answer("⏳ Задача поставлена…")
     await enqueue(run_report, {
-        "store_id": sid, "marketplace": mp,
+        "store_id": sid,
+        "marketplace": mp,
         "credentials_json": creds_json,
         "sheet_id": sheet_id,
         "sa_path": sa_path,
-    })
+        "chat_id": cb.from_user.id,           # ← добавьте
+        "menu_message_id": cb.message.message_id
+})
+
