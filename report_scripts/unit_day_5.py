@@ -1,55 +1,43 @@
 """
-unit_day_5
-──────────
-Формирует лист «unit-day» в Google Sheets.
+unit_day_5 — формирует лист «unit-day» в Google Sheets.
 
-Вызов (делает run_report):
-    run(
-        token_oz='API-KEY',
-        client_id='CLIENT-ID',
-        gs_cred ='/path/sa.json',
-        spread_id='1AbC…',
-    )
+Вызывается через run_report(run(...)).
+Все параметры (токен Ozon, client_id, JSON-ключ SA, ID таблицы)
+передаёт run_report.
+
+Логи:
+  [unit-day] Шаг X/5 …     — прогресс
+  [unit-day] ✅ Готово.     — успех
 """
 
 from __future__ import annotations
-import requests, gspread, pytz
-from datetime import datetime, timedelta, timezone
-from dateutil import tz
-from google.oauth2.service_account import Credentials
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-
-# ───────────── helpers ─────────────
-def num(x):
-    try:
-        return round(float(str(x).replace(',', '.')), 2)
-    except Exception:
-        return 0.0
-
-
-def col_letter(n: int) -> str:
-    s = ''
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-# ───────────── main ─────────────
+# ──────────────────────────────────────────────────────────────
 def run(*, token_oz: str, client_id: str,
         gs_cred: str, spread_id: str,
         sheet_main: str = "unit-day",
         sheet_src: str = "input",
         default_tax: float = 7.0) -> None:
+    """Основная точка входа: вызов синхронный."""
 
-    headers = {'Client-Id': client_id, 'Api-Key': token_oz}
+    # локальные импорты — гарантируют, что имя есть до первого обращения
+    import requests
+    import gspread, pytz
+    from google.oauth2.service_account import Credentials
+    from dateutil import tz
+
+    # ───────── настройки времени ─────────
     tz_msk = pytz.timezone('Europe/Moscow')
     now_msk = datetime.now(timezone.utc).astimezone(tz_msk)
     today_key = now_msk.strftime('%d.%m.%Y')
     today_disp = now_msk.strftime('%d.%m.%Y (%H:%M МСК)')
 
-    print("[unit-day] Шаг 1/5 — продажи за 7 дней…")
+    headers = {'Client-Id': client_id, 'Api-Key': token_oz}
+
+    # ───────── 1. Продажи ─────────
+    print("[unit-day] Шаг 1/5 — продажи…")
     url_sales = 'https://api-seller.ozon.ru/v1/analytics/data'
     sales_req = {
         "date_from": (now_msk - timedelta(days=7)).strftime('%Y-%m-%d'),
@@ -58,37 +46,31 @@ def run(*, token_oz: str, client_id: str,
         "dimension": ["sku", "day"],
         "limit": 1000
     }
-    sales_raw = requests.post(url_sales, headers=headers,
-                              json=sales_req, timeout=60).json()
+    sales_raw = requests.post(url_sales, headers=headers, json=sales_req, timeout=60).json()
 
     sales = defaultdict(lambda: {"name": None, "units": 0, "rev": 0.0})
     for r in sales_raw['result']['data']:
         sku = r['dimensions'][0]['id']
         name = r['dimensions'][0]['name']
-        day = datetime.strptime(r['dimensions'][1]['id'],
-                                '%Y-%m-%d').strftime('%d.%m.%Y')
+        day = datetime.strptime(r['dimensions'][1]['id'], '%Y-%m-%d').strftime('%d.%m.%Y')
         s = sales[(day, sku)]
         s['name'] = name
         s['units'] += r['metrics'][0]
         s['rev'] += r['metrics'][1]
 
-    print("[unit-day] Шаг 2/5 — финансы за 30 дней…")
+    # ───────── 2. Финансы ─────────
+    print("[unit-day] Шаг 2/5 — финансы…")
     url_fin = 'https://api-seller.ozon.ru/v3/finance/transaction/list'
     fin_req = {
         "filter": {"date": {
-            "from": (datetime.now(tz.tzutc()) - timedelta(days=30)
-                     ).strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-            "to": datetime.now(tz.tzutc()
-                               ).strftime('%Y-%m-%dT%H:%M:%S.000Z')},
+            "from": (datetime.now(tz.tzutc()) - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+            "to": datetime.now(tz.tzutc()).strftime('%Y-%m-%dT%H:%M:%S.000Z')},
             "transaction_type": "all"},
         "page": 1, "page_size": 1000
     }
-    fin_ops = requests.post(url_fin, headers=headers,
-                            json=fin_req, timeout=60).json() \
-        ['result']['operations']
+    fin_ops = requests.post(url_fin, headers=headers, json=fin_req, timeout=60).json()['result']['operations']
 
-    tmp = defaultdict(lambda: {"log": [], "acq": [], "last": [],
-                               "accr": 0.0, "comm": 0.0})
+    tmp = defaultdict(lambda: {"log": [], "acq": [], "last": [], "accr": 0.0, "comm": 0.0})
     for op in fin_ops:
         accr = op.get('accruals_for_sale', 0)
         comm = abs(op.get('sale_commission', 0))
@@ -112,25 +94,26 @@ def run(*, token_oz: str, client_id: str,
         svc[sku] = {"log": avg(d['log']), "acq": avg(d['acq']),
                     "last": avg(d['last']), "pct": pct}
 
-    print("[unit-day] Шаг 3/5 — подключаем Google Sheets…")
+    # ───────── 3. Sheets ─────────
+    print("[unit-day] Шаг 3/5 — Google Sheets…")
     creds = Credentials.from_service_account_file(
         gs_cred,
         scopes=['https://spreadsheets.google.com/feeds',
                 'https://www.googleapis.com/auth/drive'])
     gc = gspread.authorize(creds)
-    try:
-        sh = gc.open_by_key(spread_id)
-    except Exception as e:
-        print("[unit-day] ❌ Ошибка доступа к таблице:", e)
-        raise
-
+    sh = gc.open_by_key(spread_id)
     ws = sh.worksheet(sheet_main) if sheet_main in [w.title for w in sh.worksheets()] \
         else sh.add_worksheet(sheet_main, rows=1000, cols=30)
     sheet_id = ws.id
 
+    def num(x):
+        try:
+            return round(float(str(x).replace(',', '.')), 2)
+        except Exception:
+            return 0.0
+
     adv_map = {(r[0][:10], r[1]): num(r[5])
-               for r in ws.get_all_values()[1:]
-               if r and r[0] not in ("", "Итого")}
+               for r in ws.get_all_values()[1:] if r and r[0] not in ("", "Итого")}
 
     inp_vals = sh.worksheet(sheet_src).get_all_values()
     inp_map = {}
@@ -138,12 +121,14 @@ def run(*, token_oz: str, client_id: str,
         if not row or not row[0]:
             continue
         sku = str(row[0]).strip()
-        inp_map[sku] = {"name": row[1].strip() if len(row) > 1 else "",
-                        "sebes": num(row[2]) if len(row) > 2 else 0.0,
-                        "tax%": num(str(row[3]).replace('%', ''))
-                        if len(row) > 3 else default_tax}
+        inp_map[sku] = {
+            "name": row[1].strip() if len(row) > 1 else "",
+            "sebes": num(row[2]) if len(row) > 2 else 0.0,
+            "tax%": num(str(row[3]).replace('%', '')) if len(row) > 3 else default_tax
+        }
 
-    print("[unit-day] Шаг 4/5 — собираем таблицу…")
+    # ───────── 4. Формируем таблицу ─────────
+    print("[unit-day] Шаг 4/5 — формирование…")
     HEAD = ["Дата обновления", "SKU", "Название товара", "Количество продаж",
             "Сумма продаж", "Расходы на рекламу", "Логистика", "Комиссия Озон",
             "Эквайринг", "Последняя миля", "Налог (руб)", "Себес. Продаж",
@@ -181,9 +166,7 @@ def run(*, token_oz: str, client_id: str,
 
     table, total_idx = [HEAD], []
     r_idx = 2
-    for day in sorted(rows_by_day,
-                      key=lambda d: datetime.strptime(d, '%d.%m.%Y'),
-                      reverse=True):
+    for day in sorted(rows_by_day, key=lambda d: datetime.strptime(d, '%d.%m.%Y'), reverse=True):
         start = r_idx
         table.extend(rows_by_day[day]); r_idx += len(rows_by_day[day])
 
@@ -197,23 +180,12 @@ def run(*, token_oz: str, client_id: str,
     for i, row in enumerate(table[1:], start=2):
         if not row or row[0] in ("", "Итого"):
             continue
-        row[IDX_SEB_PR] = (
-            f'=IF({col_letter(IDX_SEB_UNIT + 1)}{i}="";"";'
-            f'ROUND({col_letter(IDX_SEB_UNIT + 1)}{i}*D{i};2))'
-        )
-        row[IDX_PROF] = (
-            f'=IF(E{i}=0;"";ROUND(E{i}-F{i}-G{i}-H{i}-I{i}-'
-            f'J{i}-K{i}-L{i};2))'
-        )
+        row[IDX_SEB_PR] = f'=IF({col_letter(IDX_SEB_UNIT+1)}{i}="";"";ROUND({col_letter(IDX_SEB_UNIT+1)}{i}*D{i};2))'
+        row[IDX_PROF] = f'=IF(E{i}=0;"";ROUND(E{i}-F{i}-G{i}-H{i}-I{i}-J{i}-K{i}-L{i};2))'
         row[IDX_MAR] = f'=IF(E{i}=0;"";ROUND(N{i}/E{i}*100;2))'
 
-    print("[unit-day] Шаг 5/5 — запись в Sheets…")
+    # ───────── 5. Запись ─────────
+    print("[unit-day] Шаг 5/5 — запись…")
     ws.clear()
     ws.update(table, 'A1', value_input_option='USER_ENTERED')
-
-    requests = []
-    # (форматирование заголовков и строк «Итого» опущено для краткости)
-    if requests:
-        ws.spreadsheet.batch_update({"requests": requests})
-
     print("[unit-day] ✅ Готово.")
