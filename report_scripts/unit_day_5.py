@@ -1,32 +1,24 @@
 """
-unit_day_5.py
-=============
-Скрипт формирует лист «unit-day»:
-  1. Выгружает продажи за 7 дней (Ozon Analytics API)
-  2. Тянет финансовые операции за 30 дней
-  3. Подмешивает себестоимость и налог из листа input
-  4. Записывает всё в Google Sheets с форматированием
+unit_day_5 — формирует лист «unit-day» в Google Sheets.
 
-Вызов:  await run(
-    token_oz="…",
-    client_id="…",
-    gs_cred="/path/to/sa.json",
-    spread_id="1AbCdE…"
-)
-
-! Весь «боевой» код находится ВНУТРИ функции run(),
-  поэтому его можно безопасно импортировать.
+Вызов:
+    run(
+        token_oz='API-KEY',
+        client_id='CLIENT-ID',
+        gs_cred='/path/to/sa.json',
+        spread_id='1AbC…',
+    )
 """
 from __future__ import annotations
 
-import requests, gspread, pytz, asyncio
+import requests, gspread, pytz
 from datetime import datetime, timedelta, timezone
 from dateutil import tz
 from google.oauth2.service_account import Credentials
 from collections import defaultdict
 
 
-# ───────────────────────── helpers ─────────────────────────
+# ───────────────────── helpers ─────────────────────
 def num(x):
     try:
         return round(float(str(x).replace(',', '.')), 2)
@@ -42,20 +34,12 @@ def col_letter(n):
     return s
 
 
-# ───────────────────────── main ─────────────────────────
-async def run(*, token_oz: str, client_id: str,
-              gs_cred: str, spread_id: str,
-              sheet_main: str = "unit-day",
-              sheet_src: str = "input",
-              default_tax: float = 7.0) -> None:
-    """
-    Параметры
-    ---------
-    token_oz   — API-Key Ozon
-    client_id  — Client-ID Ozon
-    gs_cred    — путь к JSON сервис-аккаунта
-    spread_id  — ID Google Spreadsheet
-    """
+# ───────────────────── main ─────────────────────
+def run(*, token_oz: str, client_id: str,
+        gs_cred: str, spread_id: str,
+        sheet_main: str = "unit-day",
+        sheet_src: str = "input",
+        default_tax: float = 7.0) -> None:
 
     headers = {'Client-Id': client_id, 'Api-Key': token_oz}
 
@@ -82,9 +66,10 @@ async def run(*, token_oz: str, client_id: str,
         name = r['dimensions'][0]['name']
         day = datetime.strptime(r['dimensions'][1]['id'],
                                 '%Y-%m-%d').strftime('%d.%m.%Y')
-        sales[(day, sku)]['name'] = name
-        sales[(day, sku)]['units'] += r['metrics'][0]
-        sales[(day, sku)]['rev'] += r['metrics'][1]
+        s = sales[(day, sku)]
+        s['name'] = name
+        s['units'] += r['metrics'][0]
+        s['rev'] += r['metrics'][1]
 
     # ───── 2. Финансы
     url_fin = 'https://api-seller.ozon.ru/v3/finance/transaction/list'
@@ -186,29 +171,23 @@ async def run(*, token_oz: str, client_id: str,
         ]
         rows_by_day[day].append(row)
 
-    # строка «Итого»
     table, total_idx = [HEAD], []
     r_idx = 2
     for day in sorted(rows_by_day,
                       key=lambda d: datetime.strptime(d, '%d.%m.%Y'),
                       reverse=True):
         start = r_idx
-        table.extend(rows_by_day[day])
-        r_idx += len(rows_by_day[day])
+        table.extend(rows_by_day[day]); r_idx += len(rows_by_day[day])
 
         tot = ["Итого"] + [""] * (len(HEAD) - 1)
         for ci in [3, 4, 5, 6, 7, 8, 9, 10, 11, 13]:
             ltr = col_letter(ci + 1)
             tot[ci] = f"=SUM({ltr}{start}:{ltr}{r_idx - 1})"
-        table.append(tot)
-        total_idx.append(r_idx)
-        r_idx += 1
-        table.append([""] * len(HEAD))
-        r_idx += 1
+        table.append(tot); total_idx.append(r_idx); r_idx += 1
+        table.append([""] * len(HEAD)); r_idx += 1
 
-    # формулы
     for i, row in enumerate(table[1:], start=2):
-        if not row或 row[0] in ("", "Итого"):
+        if not row or row[0] in ("", "Итого"):
             continue
         row[IDX_SEB_PR] = (
             f'=IF({col_letter(IDX_SEB_UNIT + 1)}{i}="";"";'
@@ -218,15 +197,11 @@ async def run(*, token_oz: str, client_id: str,
             f'=IF(E{i}=0;"";ROUND(E{i}-F{i}-G{i}-H{i}-I{i}-'
             f'J{i}-K{i}-L{i};2))'
         )
-        row[IDX_MAR] = (
-            f'=IF(E{i}=0;"";ROUND(N{i}/E{i}*100;2))'
-        )
+        row[IDX_MAR] = f'=IF(E{i}=0;"";ROUND(N{i}/E{i}*100;2))'
 
-    # запись
     ws.clear()
     ws.update(table, 'A1', value_input_option='USER_ENTERED')
 
-    # формат
     requests = [
         {"repeatCell": {
             "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": len(table)},
