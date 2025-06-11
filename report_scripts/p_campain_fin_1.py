@@ -1,25 +1,29 @@
 """
-p_campain_fin_1  — обновляет колонку F («Расходы на рекламу») в листе unit-day.
+p_campain_fin_1 (динамический)
+──────────────────────────────
+Запрашивает статистику Performance API, суммирует расход
+по SKU × дне и записывает значения в колонку F («Расходы на рекламу»)
+листа unit-day.
 
 run(
-    perf_client_id     = "...",
+    perf_client_id     = "...@advertising.performance.ozon.ru",
     perf_client_secret = "...",
     gs_cred            = "/path/sa.json",
-    spread_id          = "1AbC...",
-    token_oz           = "",            # игнорируется, но нужен для унификации kwargs
+    spread_id          = "1AbC…",
     days               = 7,
     worksheet_main     = "unit-day",
+    token_oz           = "",  # не используется, для унификации kwargs
     **_
 )
 """
 from __future__ import annotations
 import io, zipfile, time, requests, pandas as pd
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict
 
 
 # ───────────────────────── helpers ─────────────────────────
-def chunk(lst, n):
+def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
@@ -27,72 +31,86 @@ def chunk(lst, n):
 # ───────────────────────── main ────────────────────────────
 def run(*, perf_client_id: str, perf_client_secret: str,
         gs_cred: str, spread_id: str,
-        token_oz: str = "",       # лишний, но для совместимости
-        days: int = 7,
-        worksheet_main: str = "unit-day",
-        **_) -> None:
+        days: int = 7, worksheet_main: str = "unit-day",
+        token_oz: str = "", **_) -> None:
 
     import gspread
     from google.oauth2.service_account import Credentials
 
     host = "https://api-performance.ozon.ru"
+    endpoint_token = "/api/client/token"
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     # ---------- auth ----------
-    def refresh_token() -> datetime:
+    def refresh_access_token() -> datetime:
         payload = {"client_id": perf_client_id,
                    "client_secret": perf_client_secret,
                    "grant_type": "client_credentials"}
-        r = requests.post(f"{host}/api/client/token", headers=headers, json=payload)
+        r = requests.post(host + endpoint_token, headers=headers, json=payload)
         r.raise_for_status()
         tok = r.json()["access_token"]
         headers["Authorization"] = f"Bearer {tok}"
-        print("[ads] 🔄 token refreshed")
+        print("[ads] 🔄 новый токен Performance API")
         return datetime.now(timezone.utc)
 
-    token_time = refresh_token()
+    token_time = refresh_access_token()
 
-    # ---------- campaigns ----------
-    camps = requests.get(f"{host}/api/client/campaign", headers=headers).json()["list"]
-    camp_ids = [c["id"] for c in camps if c["state"] in
-                {"CAMPAIGN_STATE_RUNNING", "CAMPAIGN_STATE_STOPPED", "CAMPAIGN_STATE_INACTIVE"}]
+    # ---------- список кампаний ----------
+    resp = requests.get(f"{host}/api/client/campaign", headers=headers)
+    resp.raise_for_status()
+    camps = resp.json().get("list", [])
+    camp_ids = [c["id"] for c in camps
+                if c["state"] in {"CAMPAIGN_STATE_RUNNING",
+                                  "CAMPAIGN_STATE_STOPPED",
+                                  "CAMPAIGN_STATE_INACTIVE"}]
+    print(f"[ads] кампаний: {len(camp_ids)}")
 
-    # ---------- wait UUID ----------
+    # ---------- ожидание отчёта ----------
     def wait_uuid(uuid: str, interval=120):
-        nonlocal token_time                      # <-- ключевая строка
+        nonlocal token_time
         url = f"{host}/api/client/statistics/{uuid}"
         while True:
             if (datetime.now(timezone.utc) - token_time).total_seconds() > 1500:
-                token_time = refresh_token()
-            resp = requests.get(url, headers=headers)
-            state = resp.json().get("state")
-            if state == "OK":
+                token_time = refresh_access_token()
+            r = requests.get(url, headers=headers)
+            if r.status_code == 403:
+                token_time = refresh_access_token(); continue
+            js = r.json(); st = js.get("state")
+            print(f"[ads]  UUID {uuid} → {st}")
+            if st == "OK":
                 return
-            if state == "FAILED":
-                raise RuntimeError(f"Report {uuid} failed")
+            if st == "FAILED":
+                raise RuntimeError(f"report {uuid} failed")
             time.sleep(interval)
 
-    # ---------- запросы статистики ----------
-    uuids = []
+    # ---------- запрашиваем UUID-ы ----------
     date_to   = datetime.now(timezone.utc) + timedelta(hours=3)
     date_from = date_to - timedelta(days=days)
-    for chunk_ids in chunk(camp_ids, 10):
-        body = {"campaigns": chunk_ids,
-                "dateFrom": date_from.date().isoformat(),
-                "dateTo":   date_to.date().isoformat(),
-                "groupBy": "DATE"}
-        r = requests.post(f"{host}/api/client/statistics", headers=headers, json=body)
-        uuid = r.json()["UUID"]
-        uuids.append(uuid)
+    uuids: List[str] = []
+
+    for chunk in chunk_list(camp_ids, 10):
+        payload = {"campaigns": chunk,
+                   "dateFrom": date_from.date().isoformat(),
+                   "dateTo":   date_to.date().isoformat(),
+                   "groupBy": "DATE"}
+        r = requests.post(f"{host}/api/client/statistics",
+                          headers=headers, json=payload)
+        if r.status_code != 200 or "UUID" not in r.json():
+            print(f"[ads] ⚠️ ошибка запроса статистики {r.status_code}: {r.text}")
+            continue
+        uuid = r.json()["UUID"]; uuids.append(uuid)
         wait_uuid(uuid)
 
-    # ---------- скачиваем ZIP ----------
+    if not uuids:
+        print("[ads] нет отчётов"); return
+
+    # ---------- скачиваем zip ----------
     frames = []
     for uuid in uuids:
         r = requests.get(f"{host}/api/client/statistics/report",
                          headers=headers, params={"UUID": uuid})
         if r.status_code != 200 or "application/zip" not in r.headers.get("Content-Type", ""):
-            continue
+            print(f"[ads] ⚠️ не zip для {uuid} [{r.status_code}]"); continue
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
             for fn in zf.namelist():
                 if not fn.endswith((".csv", ".txt")):
@@ -100,40 +118,42 @@ def run(*, perf_client_id: str, perf_client_secret: str,
                 df = pd.read_csv(io.TextIOWrapper(zf.open(fn), "utf-8"),
                                  sep=";", skiprows=1,
                                  usecols=["День", "sku", "Расход, ₽, с НДС"])
-                df = (df[df["День"] != "Всего"]
-                      .assign(sku=lambda d: pd.to_numeric(d["sku"], errors="coerce"))
-                      .dropna(subset=["sku"]))
+                df = df[df["День"] != "Всего"]
+                df = df[pd.to_numeric(df["sku"], errors="coerce").notna()]
                 df["sku"] = df["sku"].astype(int)
-                df["Расход, ₽, с НДС"] = df["Расход, ₽, с НДС"].str.replace(",", ".").astype(float)
+                df["Расход, ₽, с НДС"] = df["Расход, ₽, с НДС"] \
+                                              .str.replace(",", ".").astype(float)
                 frames.append(df)
 
     if not frames:
-        print("[ads] нет данных"); return
+        print("[ads] нет строк"); return
 
     grp = (pd.concat(frames)
              .groupby(["День", "sku"], as_index=False)["Расход, ₽, с НДС"]
              .sum().rename(columns={"Расход, ₽, с НДС": "rub"}))
 
-    # ---------- Google-Sheets ----------
-    creds = Credentials.from_service_account_file(gs_cred,
+    # ---------- Google Sheets ----------
+    creds = Credentials.from_service_account_file(
+        gs_cred,
         scopes=["https://spreadsheets.google.com/feeds",
                 "https://www.googleapis.com/auth/drive"])
     ws = gspread.authorize(creds).open_by_key(spread_id).worksheet(worksheet_main)
 
-    sheet = ws.get_all_values()
-    hdr   = sheet[0]
-    idx_adv = hdr.index("Расходы на рекламу")   # колонка F по ТЗ
-
-    map_rows = {(r[0].split(" ")[0], int(r[1])): i+2
-                for i, r in enumerate(sheet[1:], start=1)
-                if r and r[0] not in ("", "Итого")}
+    all_vals = ws.get_all_values()
+    hdr      = all_vals[0]
+    col_adv  = hdr.index("Расходы на рекламу")   # колонка F
+    rows_map: Dict[tuple[str, int], int] = {
+        (r[0].split(" ")[0], int(r[1])): idx+2
+        for idx, r in enumerate(all_vals[1:])
+        if r and r[0] not in ("", "Итого")
+    }
 
     updates = []
-    for _, r in grp.iterrows():
-        key = (r["День"], int(r["sku"]))
-        if key in map_rows:
-            updates.append({"range": f"{chr(65+idx_adv)}{map_rows[key]}",
-                            "values": [[r["rub"]]]})
+    for _, row in grp.iterrows():
+        key = (row["День"], int(row["sku"]))
+        if key in rows_map:
+            updates.append({"range": f"{chr(65+col_adv)}{rows_map[key]}",
+                            "values": [[row["rub"]]]})
 
     if updates:
         ws.batch_update(updates)
