@@ -39,7 +39,8 @@ def run(*, token_oz: str, client_id: str,
         gs_cred: str, spread_id: str,
         sheet_main: str = "unit-day",
         sheet_src: str = "input",
-        default_tax: float = 7.0) -> None:
+        default_tax: float = 7.0,
+        **_) -> None:     # ← добавлено **_ to ignore extras
 
     # ───── локальные импорты (чётко фиксируем имена) ─────
     import requests, gspread, pytz
