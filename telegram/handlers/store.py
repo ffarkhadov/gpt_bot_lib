@@ -1,43 +1,38 @@
 from __future__ import annotations
-import logging, asyncio
+import asyncio, logging
 from aiogram import Router, F, Bot
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from telegram.keyboards import (
-    kb_store_menu, kb_del_confirm, kb_main
-)
+from telegram.keyboards import kb_store_menu, kb_del_confirm, kb_main
 from core.services.gs_db import GsDB
-from core.tasks.queue import enqueue
-from core.tasks.report_runner import run_report
+from core.tasks.store_queue import get_worker, _workers   # очередь
 
 log = logging.getLogger(__name__)
 router = Router(name="store")
 
 
-# ───────────── FSM для переименования ─────────────
+# ───────────── FSM переименование ─────────────
 class Rename(StatesGroup):
     waiting_name = State()
 
 
-# ─────────────────── открыть меню магазина ───────────────────
+# ───── открыть меню ─────
 @router.callback_query(F.data.startswith("store_"))
 async def open_store(cb: CallbackQuery):
     sid = cb.data.removeprefix("store_")
     db = GsDB()
     stores = await db.get_stores_by_owner(cb.from_user.id)
     if sid not in [s["store_id"] for s in stores]:
-        await cb.answer("Магазин не найден", show_alert=True)
-        return
+        await cb.answer("Магазин не найден", show_alert=True); return
     await cb.message.edit_text(
-        f"<b>Меню магазина</b>  <code>{sid}</code>",
-        reply_markup=kb_store_menu(sid),
-    )
+        f"<b>Меню магазина</b> <code>{sid}</code>",
+        reply_markup=kb_store_menu(sid))
     await cb.answer()
 
 
-# ─────────────────── переименование ───────────────────
+# ───── переименование ─────
 @router.callback_query(F.data.startswith("rename_"))
 async def rename_ask(cb: CallbackQuery, state: FSMContext):
     sid = cb.data.removeprefix("rename_")
@@ -59,15 +54,12 @@ async def rename_save(msg: Message, state: FSMContext, bot: Bot):
             ws.update(f"D{idx}", [[msg.text.strip()]])
             break
     await bot.delete_message(msg.chat.id, msg.message_id)
-    await bot.edit_message_text(
-        chat_id=msg.chat.id,
-        message_id=prev_mid,
-        text="✅ Название обновлено.",
-    )
+    await bot.edit_message_text(msg.chat.id, prev_mid,
+                                "✅ Название обновлено.")
     await state.clear()
 
 
-# ─────────────────── удаление ───────────────────
+# ───── удаление ─────
 @router.callback_query(F.data.startswith("delask_"))
 async def delete_ask(cb: CallbackQuery):
     sid = cb.data.removeprefix("delask_")
@@ -91,64 +83,43 @@ async def delete_ok(cb: CallbackQuery, bot: Bot):
     rows = (await db.sheets.read_all(ws))[1:]
     for idx, r in enumerate(rows, start=2):
         if r[0] == sid:
-            ws.delete_rows(idx)
-            break
+            ws.delete_rows(idx); break
     await cb.message.edit_text("🗑 Магазин удалён.")
     stores = await db.get_stores_by_owner(cb.from_user.id)
-    await cb.message.answer(
-        "Главное меню:",
-        reply_markup=kb_main(
-            [(s["store_id"], s["name"], s["marketplace"]) for s in stores]
-        ),
-    )
+    await cb.message.answer("Главное меню:",
+        reply_markup=kb_main([(s["store_id"], s["name"], s["marketplace"])
+                              for s in stores]))
     await cb.answer()
 
 
-# ─────────────────── запуск отчёта unit-day ───────────────────
-@router.callback_query(F.data.startswith("unit_"))
-async def run_unit(cb: CallbackQuery):
-    sid = cb.data.removeprefix("unit_")
-    db  = GsDB()
-    rows = (await db.sheets.read_all(await db._ws("Stores")))[1:]
-    row  = next((r for r in rows if r[0] == sid), None)
-    if not row:
-        await cb.answer("Магазин не найден", show_alert=True)
-        return
+# ───── запуск цепочки (unit→ads) ─────
+@router.callback_query(F.data.startswith("update_"))
+async def update_chain(cb: CallbackQuery):
+    sid = cb.data.removeprefix("update_")
+    db = GsDB()
+    row = next(r for r in (await db.sheets.read_all(await db._ws("Stores")))[1:]
+               if r[0] == sid)
 
-    cfg = {
+    base_cfg = {
         "store_id": sid,
-        "marketplace": row[2],
         "credentials_json": row[4],
         "sheet_id": row[5],
         "sa_path": row[6],
         "chat_id": cb.from_user.id,
+        "bot": cb.bot,
     }
-    await cb.answer("⏳ Задача поставлена…")
-    await enqueue(run_report, cfg)
+    worker = await get_worker(sid, base_cfg)
+    await worker.enqueue_chain(manual=True)
+    await cb.answer()
 
 
-# ─────────────────── запуск отчёта balans_1 ───────────────────
-@router.callback_query(F.data.startswith("balans_"))
-async def run_balans(cb: CallbackQuery):
-    sid = cb.data.removeprefix("balans_")
-    db  = GsDB()
-    rows = (await db.sheets.read_all(await db._ws("Stores")))[1:]
-    row  = next((r for r in rows if r[0] == sid), None)
-    if not row:
-        await cb.answer("Магазин не найден", show_alert=True)
-        return
-
-    cfg = {
-        "store_id": sid,
-        "marketplace": row[2],
-        "credentials_json": row[4],
-        "sheet_id": row[5],
-        "sa_path": row[6],
-        "chat_id": cb.from_user.id,
-        "script": "balans_1",  # опционально, если run_report универсальный
-    }
-    await cb.answer("⏳ Задача поставлена…")
-    await enqueue(run_report, cfg)  # если run_report универсальный
-
-    # Если у тебя есть отдельная функция, раскомментируй и меняй здесь:
-    # await enqueue(run_report_balans, cfg)
+# ───── остановить цепочку ─────
+@router.callback_query(F.data.startswith("stop_"))
+async def stop_chain(cb: CallbackQuery):
+    sid = cb.data.removeprefix("stop_")
+    w = _workers.get(sid)
+    if not w:
+        await cb.answer("Нет активного обновления"); return
+    w.cancel.set(); w.queue = asyncio.Queue()
+    await cb.answer("⏹ Остановлено.")
+    await cb.message.answer("🛑 Обновление прервано.")
