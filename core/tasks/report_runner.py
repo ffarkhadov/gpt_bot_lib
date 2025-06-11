@@ -1,17 +1,3 @@
-"""
-core/tasks/report_runner.py
-───────────────────────────
-Фоновый запуск отчётных скриптов.
-
-cfg =
-{
-  store_id, marketplace,
-  credentials_json,  # '{"client_id":"…","api_key":"…"}'
-  sheet_id, sa_path,
-  chat_id,
-  script: "unit_day_5" | "balans_1" | …
-}
-"""
 from __future__ import annotations
 import asyncio, json, inspect, logging, traceback
 from functools import partial
@@ -29,11 +15,16 @@ async def run_report(cfg: dict):
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML")
     )
+
     chat_id = cfg["chat_id"]
-    script  = cfg.get("script", "unit_day_5")       # ← по умолчанию unit_day_5
+    script  = cfg.get("script", "unit_day_5")
     nice    = "balans" if "balans" in script else "unit-day"
 
-    prog = await bot.send_message(chat_id, f"⏳ Строю отчёт <b>{nice}</b>…")
+    prog = await bot.send_message(
+        chat_id,
+        f"⏳ Строю отчёт <b>{nice}</b>… "
+        + ("(до 1 ч)" if "P_campain_fin" in script or "balans" in script else "")
+    )
 
     try:
         creds = json.loads(cfg["credentials_json"])
@@ -42,6 +33,8 @@ async def run_report(cfg: dict):
             client_id=creds.get("client_id", ""),
             gs_cred=cfg["sa_path"],
             spread_id=cfg["sheet_id"],
+            perf_client_id=creds.get("perf_client_id", ""),
+            perf_client_secret=creds.get("perf_client_secret", "")
         )
 
         mod = import_module(f"report_scripts.{script}")
@@ -54,18 +47,18 @@ async def run_report(cfg: dict):
             await loop.run_in_executor(None, partial(func, **kwargs))
 
         await bot.edit_message_text(
+            text=f"✅ Отчёт <b>{nice}</b> обновлён.",
             chat_id=chat_id,
             message_id=prog.message_id,
-            text=f"✅ Отчёт <b>{nice}</b> обновлён."
         )
         log.info("%s OK for %s (%s)", nice, cfg["store_id"], script)
 
     except Exception:
         err = traceback.format_exc()
         await bot.edit_message_text(
+            text=f"❌ <b>{nice}</b> ERROR:\n<code>{err.splitlines()[-1]}</code>",
             chat_id=chat_id,
             message_id=prog.message_id,
-            text=f"❌ <b>{nice}</b> ERROR:\n<code>{err.splitlines()[-1]}</code>"
         )
         log.error("%s FAIL for %s (%s)\n%s",
                   nice, cfg["store_id"], script, err)
