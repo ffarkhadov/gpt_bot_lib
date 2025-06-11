@@ -212,8 +212,15 @@ def run(*, token_oz: str, client_id: str,
         row[IDX_PROF] = f'=IF(E{i}=0;"";ROUND(E{i}-F{i}-G{i}-H{i}-I{i}-J{i}-K{i}-L{i};2))'
         row[IDX_MAR] = f'=IF(E{i}=0;"";ROUND(N{i}/E{i}*100;2))'
 
-    # ───────── 5. Запись ─────────
+
+    # ───────── 5. Запись (не трогаем F) ─────────
     print("[unit-day] 5/5 запись")
+
+    old = ws.get_values("F2:F")
     ws.clear()
-    ws.update(table, 'A1', value_input_option='USER_ENTERED')
+    ws.update(table, "A1", value_input_option="USER_ENTERED")
+    if old:
+        ws.update(f"F2:F{len(old)+1}", old)
+
     print("[unit-day] ✅ Готово")
+
