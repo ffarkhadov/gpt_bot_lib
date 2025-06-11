@@ -112,7 +112,8 @@ async def run_unit(cb: CallbackQuery):
     rows = (await db.sheets.read_all(await db._ws("Stores")))[1:]
     row  = next((r for r in rows if r[0] == sid), None)
     if not row:
-        await cb.answer("Магазин не найден", show_alert=True); return
+        await cb.answer("Магазин не найден", show_alert=True)
+        return
 
     cfg = {
         "store_id": sid,
@@ -125,3 +126,29 @@ async def run_unit(cb: CallbackQuery):
     await cb.answer("⏳ Задача поставлена…")
     await enqueue(run_report, cfg)
 
+
+# ─────────────────── запуск отчёта balans_1 ───────────────────
+@router.callback_query(F.data.startswith("balans_"))
+async def run_balans(cb: CallbackQuery):
+    sid = cb.data.removeprefix("balans_")
+    db  = GsDB()
+    rows = (await db.sheets.read_all(await db._ws("Stores")))[1:]
+    row  = next((r for r in rows if r[0] == sid), None)
+    if not row:
+        await cb.answer("Магазин не найден", show_alert=True)
+        return
+
+    cfg = {
+        "store_id": sid,
+        "marketplace": row[2],
+        "credentials_json": row[4],
+        "sheet_id": row[5],
+        "sa_path": row[6],
+        "chat_id": cb.from_user.id,
+        "script": "balans_1",  # опционально, если run_report универсальный
+    }
+    await cb.answer("⏳ Задача поставлена…")
+    await enqueue(run_report, cfg)  # если run_report универсальный
+
+    # Если у тебя есть отдельная функция, раскомментируй и меняй здесь:
+    # await enqueue(run_report_balans, cfg)
