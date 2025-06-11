@@ -8,6 +8,7 @@ from config import settings
 
 log = logging.getLogger(__name__)
 
+
 async def run_report(cfg: dict):
     bot: Bot = cfg["bot"]
     chat_id  = cfg["chat_id"]
@@ -21,7 +22,6 @@ async def run_report(cfg: dict):
     msg = await bot.send_message(chat_id, header)
 
     try:
-        # все потенциальные параметры
         creds = json.loads(cfg["credentials_json"])
         raw_kwargs = dict(
             token_oz           = creds.get("api_key", ""),
@@ -35,7 +35,8 @@ async def run_report(cfg: dict):
         mod  = import_module(f"report_scripts.{script}")
         func = getattr(mod, "run")
         sig  = inspect.signature(func)
-        kwargs = {k: v for k, v in raw_kwargs.items() if k in sig.parameters}
+        kwargs = {k: v for k, v in raw_kwargs.items()
+                  if k in sig.parameters}
 
         t0 = time.time()
         if inspect.iscoroutinefunction(func):
@@ -44,15 +45,20 @@ async def run_report(cfg: dict):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, partial(func, **kwargs))
         m, s = divmod(round(time.time() - t0), 60)
-        await bot.edit_message_text(chat_id, msg.message_id,
-                                    f"✅ {nice} готов ({m}м {s}с).")
+
+        await bot.edit_message_text(
+            text=f"✅ {nice} готов ({m} м {s} с).",
+            chat_id=chat_id,
+            message_id=msg.message_id
+        )
         log.info("%s OK for %s", script, cfg["store_id"])
 
     except Exception:
         err = traceback.format_exc()
         await bot.edit_message_text(
-            chat_id, msg.message_id,
-            f"❌ {nice} ERROR:\n<code>{err.splitlines()[-1]}</code>"
+            text=f"❌ {nice} ERROR:\n<code>{err.splitlines()[-1]}</code>",
+            chat_id=chat_id,
+            message_id=msg.message_id
         )
         log.error("%s FAIL for %s\n%s", script, cfg["store_id"], err)
 
