@@ -67,6 +67,11 @@ def kb_store_menu(sid: str) -> InlineKeyboardMarkup:
                 text="📝 Обновить отчёт (unit-day)", callback_data=f"unit_{sid}"
             )
         ],
+                [
+            InlineKeyboardButton(
+                text="📝 Обновить отчёт (unit-day)", callback_data=f"unit_{sid}"
+            )
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
