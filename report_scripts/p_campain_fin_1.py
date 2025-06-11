@@ -15,8 +15,11 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 def run(*, perf_client_id: str, perf_client_secret: str,
-        gs_cred: str, spread_id: str, days: int = 7,
-        worksheet_main: str = "unit-day") -> None:
+        gs_cred: str, spread_id: str,
+        token_oz: str = "",    # лишний, но чтоб не ругался
+        days: int = 7,
+        worksheet_main: str = "unit-day",
+        **_) -> None:          # ← игнорируем будущие параметры
 
     import gspread
     from google.oauth2.service_account import Credentials
