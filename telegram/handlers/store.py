@@ -7,13 +7,13 @@ from aiogram.fsm.state import State, StatesGroup
 
 from telegram.keyboards import kb_store_menu, kb_del_confirm, kb_main
 from core.services.gs_db import GsDB
-from core.tasks.store_queue import get_worker, _workers   # очередь
+from core.tasks.store_queue import get_worker, _workers
 
 log = logging.getLogger(__name__)
 router = Router(name="store")
 
 
-# ───────────── FSM переименование ─────────────
+# ───── FSM для переименования ─────
 class Rename(StatesGroup):
     waiting_name = State()
 
@@ -23,18 +23,16 @@ class Rename(StatesGroup):
 async def open_store(cb: CallbackQuery):
     sid = cb.data.removeprefix("store_")
     db = GsDB()
-    stores = await db.get_stores_by_owner(cb.from_user.id)
-    if sid not in [s["store_id"] for s in stores]:
+    if sid not in [s["store_id"] for s in await db.get_stores_by_owner(cb.from_user.id)]:
         await cb.answer("Магазин не найден", show_alert=True); return
-    await cb.message.edit_text(
-        f"<b>Меню магазина</b> <code>{sid}</code>",
-        reply_markup=kb_store_menu(sid))
+    await cb.message.edit_text(f"<b>Меню магазина</b> <code>{sid}</code>",
+                               reply_markup=kb_store_menu(sid))
     await cb.answer()
 
 
 # ───── переименование ─────
 @router.callback_query(F.data.startswith("rename_"))
-async def rename_ask(cb: CallbackQuery, state: FSMContext):
+async def rename_start(cb: CallbackQuery, state: FSMContext):
     sid = cb.data.removeprefix("rename_")
     await state.update_data(rename_sid=sid, prev_mid=cb.message.message_id)
     await cb.message.answer("Введите новое название магазина:")
@@ -92,30 +90,59 @@ async def delete_ok(cb: CallbackQuery, bot: Bot):
     await cb.answer()
 
 
-# ───── запуск цепочки (unit→ads) ─────
-@router.callback_query(F.data.startswith("update_"))
-async def update_chain(cb: CallbackQuery):
-    sid = cb.data.removeprefix("update_")
+# ───── разовый unit-day ─────
+@router.callback_query(F.data.startswith("unit_"))
+async def run_unit_once(cb: CallbackQuery):
+    await enqueue_single(cb, "unit_day_5", "unit-day")
+
+
+# ───── разовый balans ─────
+@router.callback_query(F.data.startswith("balans_"))
+async def run_balans_once(cb: CallbackQuery):
+    await enqueue_single(cb, "balans_1", "balans")
+
+
+# helper: кладём одиночный отчёт в очередь
+async def enqueue_single(cb: CallbackQuery, script: str, nice: str):
+    sid = cb.data.split("_",1)[1]
     db = GsDB()
     row = next(r for r in (await db.sheets.read_all(await db._ws("Stores")))[1:]
                if r[0] == sid)
 
-    base_cfg = {
-        "store_id": sid,
-        "credentials_json": row[4],
-        "sheet_id": row[5],
-        "sa_path": row[6],
-        "chat_id": cb.from_user.id,
+    worker = await get_worker(sid, {
+        "store_id": sid, "credentials_json": row[4],
+        "sheet_id": row[5], "sa_path": row[6],
+        "chat_id": cb.from_user.id, "bot": cb.bot,
+    })
+    await worker.queue.put({
+        **worker.base_cfg,
+        "script": script,
+        "human": nice,
+        "step": "—",
         "bot": cb.bot,
-    }
-    worker = await get_worker(sid, base_cfg)
+    })
+    await cb.answer("ℹ️ Отчёт добавлен в очередь.")
+
+
+# ───── запуск авто-цикла ─────
+@router.callback_query(F.data.startswith("update_"))
+async def start_auto(cb: CallbackQuery):
+    sid = cb.data.removeprefix("update_")
+    db = GsDB()
+    row = next(r for r in (await db.sheets.read_all(await db._ws("Stores")))[1:]
+               if r[0] == sid)
+    worker = await get_worker(sid, {
+        "store_id": sid, "credentials_json": row[4],
+        "sheet_id": row[5], "sa_path": row[6],
+        "chat_id": cb.from_user.id, "bot": cb.bot,
+    })
     await worker.enqueue_chain(manual=True)
     await cb.answer()
 
 
-# ───── остановить цепочку ─────
+# ───── остановить цикл ─────
 @router.callback_query(F.data.startswith("stop_"))
-async def stop_chain(cb: CallbackQuery):
+async def stop_auto(cb: CallbackQuery):
     sid = cb.data.removeprefix("stop_")
     w = _workers.get(sid)
     if not w:
