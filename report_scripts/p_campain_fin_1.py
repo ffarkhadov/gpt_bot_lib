@@ -1,257 +1,319 @@
 """
 report_scripts/p_campain_fin_1.py
 ─────────────────────────────────
-Заполняет колонку «Расходы на рекламу» (F) листа *unit-day* по данным
-Ozon Performance API.
+Обновляет столбец «F = Расходы на рекламу» в листе unit-day
+по данным Performance API Ozon.
 
 run(
-    gs_cred="/path/to/sa.json",
-    spread_id="1AbCdE…",
-    perf_client_id="…@advertising.performance.ozon.ru",
-    perf_client_secret="XXXX",
-    sheet_main="unit-day",          # можно переопределить
-    days=7                          # диапазон отчёта (МСК)
+    gs_cred            ='/path/sa.json',
+    spread_id          ='1AbCdE…',
+    sheet_main         ='unit-day',      # где лежит отчёт
+    perf_client_id     ='…@advertising.performance.ozon.ru',
+    perf_client_secret ='xxxxxxxx',
+    days               = 7               # глубина выборки
 )
 """
-
 from __future__ import annotations
 
-# — built-ins
-import io, zipfile, time, json, logging
-from datetime import datetime, timezone, timedelta
-from functools   import partial
-from pathlib     import Path
-from typing      import List
+import io
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
-# — 3-rd party
-import requests, pandas as pd, gspread
+import pandas as pd
+import requests
+import gspread
 from google.oauth2.service_account import Credentials
 
-log = logging.getLogger(__name__)
-HOST = "https://api-performance.ozon.ru"
-TOKEN_EP = "/api/client/token"
-CAMPAIGN_EP = "/api/client/campaign"
-STAT_EP = "/api/client/statistics"
-REPORT_EP = "/api/client/statistics/report"
-
-# ---------------------------------------------------------------------------
-#                               ── helpers ──
-# ---------------------------------------------------------------------------
-def auth_headers(token: str | None = None) -> dict[str, str]:
-    hdr = {"Content-Type": "application/json", "Accept": "application/json"}
-    if token:
-        hdr["Authorization"] = f"Bearer {token}"
-    return hdr
+# ───────────────────────── helpers ──────────────────────────
+API_HOST = "https://api-performance.ozon.ru"
+TZ_UTC   = timezone.utc
 
 
-def get_token(pid: str, psecret: str) -> tuple[str, datetime]:
-    """client_credentials → (token, timeUTC)"""
+def log(msg: str):
+    """Мини-логгер (stdout попадает в journalctl)."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def backoff_sleep(sec: int):
+    """Спит с выводом секундомера (чтобы в Telegram было видно «живой» лог)."""
+    for _ in range(sec):
+        time.sleep(1)
+        print(".", end="", flush=True)
+    print()
+
+
+def get_token(client_id: str, client_secret: str) -> tuple[str, datetime]:
     r = requests.post(
-        f"{HOST}{TOKEN_EP}",
-        headers=auth_headers(),
-        json={"client_id": pid, "client_secret": psecret,
-              "grant_type": "client_credentials"},
-        timeout=60,
+        f"{API_HOST}/api/client/token",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        },
+        timeout=None,                 # как в локальном скрипте
     )
     r.raise_for_status()
-    tok = r.json()["access_token"]
-    log.info("PerformanceAPI token OK (%s…)", tok[:8])
-    return tok, datetime.now(timezone.utc)
+    token = r.json()["access_token"]
+    log(f"PerformanceAPI token OK ({token[:10]}…)")
+
+    return token, datetime.now(TZ_UTC)
 
 
-def refresh_if_needed(token: str, t0: datetime,
-                      pid: str, psecret: str) -> tuple[str, datetime]:
-    """Через 25 мин обновляем токен"""
-    if (datetime.now(timezone.utc) - t0).total_seconds() < 1_500:
-        return token, t0
-    log.info("PerformanceAPI token refresh…")
-    return get_token(pid, psecret)
+def chunk(lst: list, size: int = 10):
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
 
 
-def moscow_dates(days: int = 7) -> tuple[str, str]:
-    now_utc = datetime.now(timezone.utc)
-    msk = now_utc + timedelta(hours=3)
-    return (msk - timedelta(days=days)).strftime("%Y-%m-%d"), msk.strftime("%Y-%m-%d")
-
-
-def chunked(seq: list, n: int):
-    for i in range(0, len(seq), n):
-        yield seq[i : i + n]
-
-
-# ---------------------------------------------------------------------------
-#                   ── fetch UUID-pages for a chunk of campaigns ──
-# ---------------------------------------------------------------------------
-def fetch_all_pages(cids: List[int], date_from: str, date_to: str,
-                    token: str, pid: str, psecret: str) -> List[str]:
-    uuids: List[str] = []
-    offset = 0
-    while True:
-        token, _ = refresh_if_needed(token, fetch_all_pages.t0, pid, psecret)
-        payload = {
-            "campaigns": cids, "dateFrom": date_from, "dateTo": date_to,
-            "groupBy": "DATE", "offset": offset, "limit": 1_000,
-        }
-        r = requests.post(f"{HOST}{STAT_EP}", headers=auth_headers(token),
-                          json=payload, timeout=120)
-        r.raise_for_status()
-        data = r.json()
-        uuid = data.get("UUID")
-        if not uuid:
-            break
-        uuids.append(uuid)
-        log.debug("chunk %s → UUID %s (offset %s)", cids[:3], uuid, offset)
-        if not data.get("has_more"):
-            break
-        offset += payload["limit"]
-    return uuids
-# инициализируем «статическое» поле с моментом последнего токена
-fetch_all_pages.t0 = datetime.now(timezone.utc)
-
-
-def wait_ready(uuid: str, token: str, pid: str, psecret: str) -> None:
-    url = f"{HOST}{STAT_EP}/{uuid}"
-    while True:
-        token, _ = refresh_if_needed(token, wait_ready.t0, pid, psecret)
-        r = requests.get(url, headers=auth_headers(token), timeout=60)
-        if r.status_code == 403:                      # просроченный токен
-            token, _ = get_token(pid, psecret)
-            wait_ready.t0 = datetime.now(timezone.utc)
-            continue
-        r.raise_for_status()
-        st = r.json().get("state")
-        if st == "OK":
-            return
-        if st == "FAILED":
-            raise RuntimeError(f"UUID {uuid} state=FAILED")
-        time.sleep(120)
-# статическое поле
-wait_ready.t0 = datetime.now(timezone.utc)
-
-
-# ---------------------------------------------------------------------------
-#                   ── main entry point used by the bot ──
-# ---------------------------------------------------------------------------
-def run(*,
-        gs_cred: str,
-        spread_id: str,
-        perf_client_id: str,
-        perf_client_secret: str,
-        sheet_main: str = "unit-day",
-        days: int = 7) -> None:
-    """
-    Обновляет F-столбец «Расходы на рекламу» в листe *sheet_main*.
-    остальные аргументы игнорируются; передаются ботом «на всякий».
-    """
-
-    # 1) токен + список кампаний ------------------------------------------------
-    token, t0 = get_token(perf_client_id, perf_client_secret)
-    fetch_all_pages.t0 = wait_ready.t0 = t0                      # синхронизируем
-
-    r = requests.get(f"{HOST}{CAMPAIGN_EP}", headers=auth_headers(token), timeout=60)
+def fetch_campaign_ids(session: requests.Session, headers: dict) -> list[str]:
+    r = session.get(f"{API_HOST}/api/client/campaign", headers=headers, timeout=None)
     r.raise_for_status()
-    campaigns = [it["id"] for it in r.json()["list"]
-                 if it.get("state") in {"CAMPAIGN_STATE_RUNNING",
-                                        "CAMPAIGN_STATE_STOPPED",
-                                        "CAMPAIGN_STATE_INACTIVE"}]
-    log.info("campaigns: %s", campaigns)
+    target_states = {
+        "CAMPAIGN_STATE_RUNNING",
+        "CAMPAIGN_STATE_STOPPED",
+        "CAMPAIGN_STATE_INACTIVE",
+    }
+    ids = [str(c["id"]) for c in r.json()["list"] if c.get("state") in target_states]
+    log(f"campaigns: {ids}")
+    return ids
 
-    date_from, date_to = moscow_dates(days)
 
-    # 2) собираем ВСЕ uuid-страницы ---------------------------------------------
-    all_uuids: list[str] = []
-    for chunk in chunked(campaigns, 10):
-        all_uuids += fetch_all_pages(chunk, date_from, date_to,
-                                     token, perf_client_id, perf_client_secret)
-
-    if not all_uuids:
-        log.warning("no data pages -> exit")
-        return
-    log.info("total UUID pages: %d", len(all_uuids))
-
-    # 3) грузим zip-отчёты -------------------------------------------------------
-    frames = []
-    for uid in all_uuids:
-        wait_ready(uid, token, perf_client_id, perf_client_secret)
-        r = requests.get(REPORT_EP, headers=auth_headers(token),
-                         params={"UUID": uid}, timeout=300)
-        r.raise_for_status()
-        if "application/zip" not in r.headers.get("Content-Type", ""):
-            log.warning("UUID %s returned not-zip, skip", uid)
+def stats_request(
+    session: requests.Session,
+    headers: dict,
+    camp_ids: list[str],
+    date_from: str,
+    date_to: str,
+) -> str:
+    """Отправляем запрос → получаем UUID. Обработка 429."""
+    while True:
+        r = session.post(
+            f"{API_HOST}/api/client/statistics",
+            headers=headers,
+            json={
+                "campaigns": camp_ids,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "groupBy": "DATE",
+            },
+            timeout=None,
+        )
+        if r.status_code == 429:
+            log("⚠️ 429 Too Many Requests – ждём 65 с…")
+            backoff_sleep(65)
             continue
-        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        r.raise_for_status()
+        uuid = r.json()["UUID"]
+        return uuid
+
+
+def wait_uuid(
+    session: requests.Session,
+    headers_fn,
+    uuid: str,
+    token_expiry: datetime,
+    client_id: str,
+    client_secret: str,
+    poll_sec: int = 60,
+):
+    """Ожидаем готовности UUID. Перезапрашиваем токен при необходимости."""
+    url = f"{API_HOST}/api/client/statistics/{uuid}"
+    while True:
+        # истёк ли токен (±25 минут)?
+        if (datetime.now(TZ_UTC) - token_expiry).total_seconds() > 1500:
+            new_token, token_expiry = get_token(client_id, client_secret)
+            headers_fn({"Authorization": f"Bearer {new_token}"})
+
+        r = session.get(url, headers=headers_fn(), timeout=None)
+        if r.status_code == 429:
+            log("⚠️ 429 на UUID-check – ждём 65 с…")
+            backoff_sleep(65)
+            continue
+        r.raise_for_status()
+        state = r.json()["state"]
+        log(f"uuid {uuid} → {state}")
+
+        if state == "OK":
+            return
+        if state == "FAILED":
+            raise RuntimeError(f"uuid {uuid} FAILED")
+
+        time.sleep(poll_sec)
+
+
+def fetch_report_file(session: requests.Session, headers: dict, uuid: str) -> bytes:
+    """Скачиваем ZIP-отчёт."""
+    r = session.get(
+        f"{API_HOST}/api/client/statistics/report",
+        headers=headers,
+        params={"UUID": uuid},
+        timeout=None,
+    )
+    if r.status_code == 429:
+        log("⚠️ 429 при скачивании ZIP – ждём 65 с…")
+        backoff_sleep(65)
+        return fetch_report_file(session, headers, uuid)
+
+    r.raise_for_status()
+    if "application/zip" not in r.headers.get("Content-Type", ""):
+        raise RuntimeError(f"uuid {uuid}: не ZIP")
+    return r.content
+
+
+def parse_zip(data: bytes) -> pd.DataFrame:
+    """Читаем все CSV внутри ZIP, возвращаем df с колонками date, sku, rub."""
+    rows = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for fn in zf.namelist():
-            with zf.open(fn) as fd:
-                try:
-                    df = pd.read_csv(io.TextIOWrapper(fd, "utf-8"),
-                                     sep=";", skiprows=0,
-                                     usecols=["День", "sku", "Расход, ₽, с НДС"])
-                    frames.append(df)
-                except Exception as e:
-                    log.debug("file %s ignored (%s)", fn, e)
+            if not (fn.endswith(".csv") or fn.endswith(".txt")):
+                continue
+            df = pd.read_csv(
+                io.TextIOWrapper(zf.open(fn), "utf-8"),
+                sep=";",
+                skiprows=1,
+                usecols=["День", "sku", "Расход, ₽, с НДС"],
+            )
+            df = df[df["День"] != "Всего"]
+            df["sku"] = pd.to_numeric(df["sku"], errors="coerce").dropna().astype(int)
+            df["Расход, ₽, с НДС"] = (
+                df["Расход, ₽, с НДС"].astype(str).str.replace(",", ".").astype(float)
+            )
+            rows.append(df)
 
-    if not frames:
-        log.warning("no csv rows parsed")
-        return
+    if not rows:
+        return pd.DataFrame(columns=["date", "sku", "rub"])
 
-    # 4) агрегируем --------------------------------------------------------------
-    df = pd.concat(frames, ignore_index=True)
-    df = df[df["День"] != "Всего"]
-    df = df[df["sku"].notna()]
+    df_all = pd.concat(rows, ignore_index=True)
+    df_all = (
+        df_all.groupby(["День", "sku"], as_index=False)["Расход, ₽, с НДС"]
+        .sum()
+        .rename(columns={"День": "date", "Расход, ₽, с НДС": "rub"})
+    )
+    return df_all
 
-    df["date"] = pd.to_datetime(df["День"], dayfirst=True).dt.strftime("%d.%m.%Y")
-    df["sku"]  = pd.to_numeric(df["sku"], errors="coerce").astype("Int64")
-    df["rub"]  = pd.to_numeric(df["Расход, ₽, с НДС"].str.replace(",", "."),
-                               errors="coerce").fillna(0.0)
 
-    grouped = (df.groupby(["date", "sku"], as_index=False)["rub"].sum())
-    log.info("rows after groupby: %d", len(grouped))
-
-    # 5) Sheets -----------------------------------------------------------------
+def write_to_sheet(
+    gs_cred: str,
+    spread_id: str,
+    sheet_name: str,
+    df_rub: pd.DataFrame,
+):
+    """Записываем суммы в столбец F, сопоставляя (Дата, SKU)."""
     creds = Credentials.from_service_account_file(
         gs_cred,
-        scopes=["https://spreadsheets.google.com/feeds",
-                "https://www.googleapis.com/auth/drive"]
+        scopes=[
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
-    sh = gspread.authorize(creds).open_by_key(spread_id)
-    ws = sh.worksheet(sheet_main)
+    ws = (
+        gspread.authorize(creds)
+        .open_by_key(spread_id)
+        .worksheet(sheet_name)
+    )
 
-    sheet_vals = ws.get_all_values()
-    if not sheet_vals:
-        log.warning("sheet '%s' empty – nothing to update", sheet_main)
+    values = ws.get_all_values()
+    if not values:
+        log("⚠️ Лист пуст – ничего записывать")
         return
 
-    head = sheet_vals[0]
+    head = values[0]
     try:
         col_date = head.index("Дата обновления")
         col_sku  = head.index("SKU")
-        col_adv  = head.index("Расходы на рекламу")
+        col_rub  = 5  # столбец F
     except ValueError as e:
-        raise RuntimeError(f"sheet '{sheet_main}': {e}")
+        raise RuntimeError("В unit-day нет нужных столбцов") from e
 
-    # строим map (date,sku) → row_idx
-    positions = {}
-    for ridx, row in enumerate(sheet_vals[1:], start=2):
-        if len(row) <= max(col_date, col_sku):
-            continue
-        d = (row[col_date].split(" ")[0]).strip()
-        try:
-            s = int(float(row[col_sku]))
-        except Exception:
-            continue
-        positions[(d, s)] = ridx
+    # строим мапу (date, sku) → index row_in_sheet
+    pos = defaultdict(list)
+    for i, row in enumerate(values[1:], start=2):  # строки в GS – с 2
+        d = (row[col_date].split(" ")[0] if row[col_date] else "", row[col_sku])
+        pos[d].append(i)
 
-    batch = []
-    for _, r in grouped.iterrows():
-        key = (r["date"], int(r["sku"]))
-        ridx = positions.get(key)
-        if not ridx:
-            continue            # продаж ещё нет → строка появится позже
-        batch.append({"range": f"{gspread.utils.rowcol_to_a1(ridx, col_adv+1)}",
-                      "values": [[round(r["rub"], 2)]]})
+    updates = []
+    for _, r in df_rub.iterrows():
+        key = (r["date"], str(r["sku"]))
+        for row_idx in pos.get(key, []):
+            updates.append(
+                {
+                    "range": f"F{row_idx}",
+                    "values": [[round(r["rub"], 2)]],
+                }
+            )
 
-    if batch:
-        ws.batch_update(batch, value_input_option="USER_ENTERED")
-        log.info("updated %d cells in column F", len(batch))
+    if updates:
+        ws.batch_update(updates)
+        log(f"🟢 Записано {len(updates)} ячеек в unit-day (столбец F)")
     else:
-        log.info("nothing to update in column F")
+        log("ℹ️ Совпадений (дата+sku) не найдено – ничего не записано")
+
+
+# ──────────────────────────── run() ─────────────────────────
+def run(
+    *,
+    gs_cred: str,
+    spread_id: str,
+    sheet_main: str = "unit-day",
+    perf_client_id: str,
+    perf_client_secret: str,
+    days: int = 7,
+):
+    session = requests.Session()
+
+    # 1. токен
+    token, token_time = get_token(perf_client_id, perf_client_secret)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    def headers_proxy(new: dict | None = None):
+        """callback для подмены Authorization при обновлении токена"""
+        if new:
+            headers.update(new)
+        return headers
+
+    # 2. кампании
+    camp_ids = fetch_campaign_ids(session, headers)
+
+    # 3. даты
+    now_msk = datetime.now(TZ_UTC) + timedelta(hours=3)
+    date_to = now_msk.date()
+    date_from = (now_msk - timedelta(days=days)).date()
+    df_str, dt_str = date_from.strftime("%Y-%m-%d"), date_to.strftime("%Y-%m-%d")
+
+    # 4. собираем UUID-ы (с учётом лимитов)
+    all_uuids: list[str] = []
+    for ch in chunk(camp_ids, 10):  # как в локальном скрипте
+        uuid = stats_request(session, headers, ch, df_str, dt_str)
+        log(f"uuid {uuid} OK → wait")
+        wait_uuid(
+            session,
+            headers_proxy,
+            uuid,
+            token_time,
+            perf_client_id,
+            perf_client_secret,
+            poll_sec=60,
+        )
+        all_uuids.append(uuid)
+        time.sleep(1)  # мягкий глобальный RPS-лимит
+
+    # 5. скачиваем ZIP-ы и консолидируем
+    df_total = pd.DataFrame(columns=["date", "sku", "rub"])
+    for u in all_uuids:
+        zip_bytes = fetch_report_file(session, headers, u)
+        df = parse_zip(zip_bytes)
+        df_total = pd.concat([df_total, df], ignore_index=True)
+
+    if df_total.empty:
+        log("⚠️ Performance-данных нет – выход")
+        return
+
+    # 6. пишем в Sheets
+    write_to_sheet(gs_cred, spread_id, sheet_main, df_total)
+    log("✅ p_campain_fin_1 DONE")
