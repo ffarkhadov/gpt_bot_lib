@@ -1,303 +1,487 @@
 """
 report_scripts/p_campain_fin_1.py
----------------------------------
-Обновляет столбец F («Расходы на рекламу») в листе unit-day.
+─────────────────────────────────
+Заполняет столбец F «Расходы на рекламу» в unit-day
+по данным Performance API Ozon.
 
-run(
-    gs_cred             = '/path/sa.json',
-    spread_id           = '1AbCdE...',
-    perf_client_id      = '…@advertising.performance.ozon.ru',
-    perf_client_secret  = '******',
-    sheet_main          = 'unit-day',   # опционально
-    days                = 7            # глубина отчёта
-)
+Оптимизированная версия максимально близкая к локальной
+с улучшенной обработкой лимитов API и полным сбором данных.
 """
 from __future__ import annotations
 
-import os, io, time, json, zipfile, requests, pandas as pd
-from typing     import Iterable
-from datetime   import datetime, timezone, timedelta
-from itertools  import islice
-from pathlib    import Path
-from google.oauth2.service_account import Credentials
+import io
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+from typing import Callable
+
+import pandas as pd
+import requests
 import gspread
-import logging
+from google.oauth2.service_account import Credentials
 
-log = logging.getLogger(__name__)
+API = "https://api-performance.ozon.ru"
+UTC = timezone.utc
 
-# ──────────────────── настройки/константы ────────────────────
-API_HOST       = "https://api-performance.ozon.ru"
-TOKEN_ENDPOINT = "/api/client/token"
-STATS_ENDP     = "/api/client/statistics"
-REPORT_ENDP    = "/api/client/statistics/report"
-
-CHUNK_SIZE     = 8          # кампаний в одном запросе
-WAIT_SEC       = 60         # пауза между polls UUID
-MAX_PAGES      = 10         # подстраховка от бесконечного цикла
-TIMEOUT        = 40         # requests timeout
-
-USECOL_SETS = [
-    ["День", "sku", "Расход, ₽, с НДС"],
-    ["Day", "sku", "Spend, ₽ incl. VAT"],
-    ["Day", "sku", "Spend, ₽"],
-]
-
-# ──────────────────── helpers ────────────────────
-def grouper(it: Iterable, n: int):
-    """([1,2,3,4,5], 2) → (1,2) (3,4) (5,)"""
-    it = iter(it)
-    while (chunk := tuple(islice(it, n))):
-        yield chunk
+# Увеличенные таймауты для стабильной работы
+REQUEST_TIMEOUT = 60
+RETRY_DELAY = 70  # Задержка при 429 ошибках
+UUID_CHECK_INTERVAL = 120  # Интервал проверки UUID (как в локальной версии)
 
 
-def best_usecols(cols: list[str]) -> list[str]:
-    for st in USECOL_SETS:
-        if set(st).issubset(cols):
-            return st
-    raise ValueError("Не найден подходящий набор колонок для {}".format(cols))
+# ──────────────────────────── helpers ────────────────────────────
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def iso_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+def sleep_progress(sec: int, msg: str = ""):
+    if msg:
+        log(msg)
+    for i in range(sec):
+        time.sleep(1)
+        print(".", end="", flush=True)
+        if (i + 1) % 10 == 0:
+            print(f" {i + 1}/{sec}")
+    print()
 
 
-def parse_zip(b: bytes, debug_sku: str | None = None) -> pd.DataFrame:
-    """ZIP → DataFrame(date, sku, rub)"""
-    dfs = []
-    with zipfile.ZipFile(io.BytesIO(b)) as zf:
-        for fn in zf.namelist():
-            with zf.open(fn) as f:
-                df = pd.read_csv(
-                    io.TextIOWrapper(f, "utf-8"), sep=";", skiprows=1
-                )
-            cols = best_usecols(list(df.columns))
-            df = df[cols]
-            df = df.query("sku.notna() & sku != 'inf' & sku != '-inf'")
-            df["sku"] = pd.to_numeric(df["sku"], errors="coerce").astype("Int64")
-            df["rub"] = (
-                df[cols[2]].astype(str).str.replace(",", ".").astype(float)
+def get_token(session: requests.Session, cid: str, secret: str) -> tuple[str, datetime]:
+    """Получение токена с retry логикой"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = session.post(
+                f"{API}/api/client/token",
+                json={"client_id": cid, "client_secret": secret, "grant_type": "client_credentials"},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
             )
-            df.rename(columns={cols[0]: "date"}, inplace=True)
-            dfs.append(df[["date", "sku", "rub"]])
-
-            # отладочный дамп
-            if debug_sku and not df[df["sku"] == int(debug_sku)].empty:
-                df[df["sku"] == int(debug_sku)].to_csv(
-                    f"/tmp/ads_raw_{debug_sku}.csv", index=False
-                )
-                log.info("[DEBUG] dump for SKU %s saved to /tmp/ads_raw_%s.csv",
-                         debug_sku, debug_sku)
-
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-
-# ──────────────────── Performance-API ────────────────────
-def get_token(client_id: str, client_secret: str) -> tuple[str, datetime]:
-    r = requests.post(
-        API_HOST + TOKEN_ENDPOINT,
-        json={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "client_credentials",
-        },
-        timeout=TIMEOUT,
-    )
-    r.raise_for_status()
-    token = r.json()["access_token"]
-    log.info("token OK (%.10s…)", token)
-    return token, datetime.now(timezone.utc)
+            if r.status_code == 429:
+                sleep_progress(RETRY_DELAY, f"⚠️ 429 при получении токена (попытка {attempt + 1})")
+                continue
+            r.raise_for_status()
+            token = r.json()["access_token"]
+            log(f"✅ Токен получен ({token[:10]}...)")
+            return token, datetime.now(UTC)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            log(f"⚠️ Ошибка получения токена (попытка {attempt + 1}): {e}")
+            time.sleep(5)
 
 
-def refresh_if_needed(token: str, t0: datetime,
-                      client_id: str, client_secret: str) -> tuple[str, datetime]:
-    if (datetime.now(timezone.utc) - t0).total_seconds() < 1500:
-        return token, t0
-    return get_token(client_id, client_secret)
+def ensure_token(session: requests.Session,
+                 token_time: datetime,
+                 cid: str,
+                 secret: str,
+                 headers_cb: Callable[[dict], None]) -> datetime:
+    """Обновляет токен, если прошло >25 мин (как в локальной версии)"""
+    if (datetime.now(UTC) - token_time).total_seconds() <= 1500:  # 25 минут
+        return token_time
+    log("🔄 Обновление токена по времени...")
+    new_token, new_time = get_token(session, cid, secret)
+    headers_cb({"Authorization": f"Bearer {new_token}"})
+    return new_time
 
 
-def wait_uuid(uuid: str, headers: dict[str, str]) -> None:
-    url = f"{API_HOST}{STATS_ENDP}/{uuid}"
-    for _ in range(MAX_PAGES * 3):               # max ~30 мин
-        r = requests.get(url, headers=headers, timeout=TIMEOUT)
-        if r.status_code == 404:
-            time.sleep(WAIT_SEC)
-            continue
-        r.raise_for_status()
-        state = r.json().get("state")
-        log.info("uuid %s → %s", uuid, state)
-        if state == "OK":
+def chunk(lst: list, n: int = 10):
+    """Разбивка списка на чанки (как в локальной версии)"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+# ─────────────────── работа с Performance API ────────────────────
+def fetch_campaigns(session: requests.Session, headers: dict) -> list[str]:
+    """Получение списка кампаний с retry логикой"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = session.get(f"{API}/api/client/campaign", headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429:
+                sleep_progress(RETRY_DELAY, f"⚠️ 429 при получении кампаний (попытка {attempt + 1})")
+                continue
+            r.raise_for_status()
+            
+            # Точно такие же состояния как в локальной версии
+            target_states = {'CAMPAIGN_STATE_RUNNING', 'CAMPAIGN_STATE_STOPPED', 'CAMPAIGN_STATE_INACTIVE'}
+            ids = [str(c["id"]) for c in r.json()["list"] if c.get("state") in target_states]
+            log(f"📋 Найдено кампаний: {len(ids)} {ids}")
+            return ids
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            log(f"⚠️ Ошибка получения кампаний (попытка {attempt + 1}): {e}")
+            time.sleep(5)
+
+
+def post_statistics(session: requests.Session,
+                    headers: dict,
+                    camp_ids: list[str],
+                    date_from: str,
+                    date_to: str) -> str:
+    """Отправка запроса на статистику с полной retry логикой"""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            payload = {
+                "campaigns": camp_ids,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "groupBy": "DATE"  # Точно как в локальной версии
+            }
+            
+            r = session.post(
+                f"{API}/api/client/statistics",
+                headers=headers,
+                json=payload,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if r.status_code == 429:
+                sleep_progress(RETRY_DELAY, f"⚠️ 429 при запросе статистики (попытка {attempt + 1})")
+                continue
+                
+            r.raise_for_status()
+            uuid = r.json()["UUID"]
+            log(f"📥 UUID получен: {uuid}")
+            return uuid
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            log(f"⚠️ Ошибка запроса статистики (попытка {attempt + 1}): {e}")
+            time.sleep(10)
+
+
+def wait_uuid(session: requests.Session,
+              uuid: str,
+              headers_fn: Callable[[], dict],
+              refresh_token_fn: Callable[[], None]):
+    """Ожидание готовности UUID - точная копия логики из локальной версии"""
+    url = f"{API}/api/client/statistics/{uuid}"
+    log(f"⏳ Ждём готовности UUID: {uuid}")
+    
+    while True:
+        try:
+            # Обновляем токен если нужно
+            refresh_token_fn()
+            
+            r = session.get(url, headers=headers_fn(), timeout=REQUEST_TIMEOUT)
+            
+            if r.status_code == 429:
+                sleep_progress(RETRY_DELAY, "⚠️ 429 при проверке UUID")
+                continue
+                
+            if r.status_code == 403:
+                log("⚠️ 403 при проверке UUID - принудительное обновление токена")
+                refresh_token_fn()
+                continue
+                
+            r.raise_for_status()
+            
+            data = r.json()
+            state = data.get("state")
+            log(f"🔍 UUID {uuid} → state: {state}")
+            
+            if state == "OK":
+                log(f"✅ Отчёт готов: {uuid}")
+                return
+                
+            if state == "FAILED":
+                raise RuntimeError(f"❌ UUID {uuid} завершился с ошибкой")
+                
+        except Exception as e:
+            log(f"⚠️ Исключение при проверке UUID {uuid}: {e}")
+        
+        # Интервал как в локальной версии
+        time.sleep(UUID_CHECK_INTERVAL)
+
+
+def download_zip(session: requests.Session, headers: dict, uuid: str) -> bytes:
+    """Скачивание ZIP отчёта с retry логикой"""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            r = session.get(
+                f"{API}/api/client/statistics/report",
+                headers=headers, 
+                params={"UUID": uuid}, 
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if r.status_code == 429:
+                sleep_progress(RETRY_DELAY, f"⚠️ 429 при скачивании ZIP (попытка {attempt + 1})")
+                continue
+                
+            if r.status_code == 403:
+                log(f"⚠️ 403 при скачивании ZIP {uuid} - возможно токен устарел")
+                raise requests.exceptions.HTTPError("403 Forbidden")
+                
+            r.raise_for_status()
+            
+            if "application/zip" not in r.headers.get("Content-Type", ""):
+                raise RuntimeError(f"Неожиданный тип контента для UUID {uuid}")
+                
+            log(f"📦 ZIP скачан для UUID {uuid}")
+            return r.content
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            log(f"⚠️ Ошибка скачивания ZIP (попытка {attempt + 1}): {e}")
+            time.sleep(10)
+
+
+# ─────────────────────── CSV → DataFrame ────────────────────────
+def parse_zip(data: bytes) -> pd.DataFrame:
+    """Парсинг ZIP - максимально близко к локальной версии"""
+    all_data = []
+    
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zip_ref:
+            for file_name in zip_ref.namelist():
+                if not (file_name.endswith('.csv') or file_name.endswith('.txt')):
+                    continue
+                    
+                try:
+                    with zip_ref.open(file_name) as f:
+                        decoded = io.TextIOWrapper(f, encoding='utf-8')
+                        df = pd.read_csv(decoded, sep=';', skiprows=1)
+                        
+                        # Точные названия колонок как в локальной версии
+                        required_columns = ['День', 'sku', 'Расход, ₽, с НДС']
+                        if not all(col in df.columns for col in required_columns):
+                            log(f"⚠️ Файл {file_name} не содержит необходимых колонок")
+                            continue
+                            
+                        df_selected = df[required_columns].copy()
+                        
+                        # Фильтрация точно как в локальной версии
+                        df_selected = df_selected[df_selected['День'] != 'Всего']
+                        df_selected = df_selected[
+                            df_selected['sku'].notna() & 
+                            ~df_selected['sku'].isin([float('inf'), -float('inf')])
+                        ]
+                        
+                        if df_selected.empty:
+                            continue
+                            
+                        # Преобразование типов точно как в локальной версии
+                        try:
+                            df_selected['sku'] = df_selected['sku'].astype(int)
+                        except Exception as e:
+                            log(f"⚠️ Ошибка преобразования SKU в файле {file_name}: {e}")
+                            continue
+                            
+                        all_data.append(df_selected)
+                        
+                except Exception as e:
+                    log(f"⚠️ Ошибка обработки файла {file_name}: {e}")
+                    continue
+                    
+    except zipfile.BadZipFile as e:
+        log(f"❌ Неверный ZIP файл: {e}")
+        return pd.DataFrame(columns=['date', 'sku', 'rub'])
+    
+    if not all_data:
+        log("⚠️ Нет данных для обработки")
+        return pd.DataFrame(columns=['date', 'sku', 'rub'])
+    
+    # Объединение и группировка точно как в локальной версии
+    combined_df = pd.concat(all_data, ignore_index=True)
+    
+    try:
+        # Преобразование расходов точно как в локальной версии
+        combined_df['Расход, ₽, с НДС'] = combined_df['Расход, ₽, с НДС'].replace({',': '.'}, regex=True).astype(float)
+    except Exception as e:
+        log(f"❌ Ошибка преобразования столбца расходов: {e}")
+        return pd.DataFrame(columns=['date', 'sku', 'rub'])
+    
+    # Группировка точно как в локальной версии
+    grouped_df = combined_df.groupby(['День', 'sku'], as_index=False)['Расход, ₽, с НДС'].sum()
+    grouped_df.columns = ['date', 'sku', 'rub']
+    
+    log(f"📊 Обработано строк: {len(grouped_df)}")
+    return grouped_df
+
+
+# ─────────────────────── запись в Google Sheets ──────────────────────
+def write_sheet(gs_cred: str, spread_id: str, sheet_name: str, df: pd.DataFrame):
+    """Запись в Google Sheets - логика из локальной версии"""
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_file(gs_cred, scopes=scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(spread_id).worksheet(sheet_name)
+        
+        # Получаем существующие данные
+        existing_values = sheet.get_all_values()
+        if not existing_values:
+            log("⚠️ Лист пуст")
             return
-        if state == "FAILED":
-            raise RuntimeError(f"UUID {uuid} FAILED")
-        time.sleep(WAIT_SEC)
-    raise TimeoutError(f"UUID {uuid} wait timeout")
+            
+        sheet_df = pd.DataFrame(existing_values[1:], columns=existing_values[0])
+        
+        # Проверяем необходимые колонки
+        required_sheet_columns = ['Дата обновления', 'SKU']
+        if not all(col in sheet_df.columns for col in required_sheet_columns):
+            raise RuntimeError(f"❌ Не найдены колонки {required_sheet_columns} в Google Таблице")
+        
+        # Преобразование данных точно как в локальной версии
+        sheet_df['Дата обновления'] = sheet_df['Дата обновления'].apply(
+            lambda x: x.split(' ')[0] if isinstance(x, str) and ' ' in x else x
+        )
+        
+        try:
+            sheet_df['SKU'] = pd.to_numeric(sheet_df['SKU'], errors='coerce').astype('Int64')
+        except Exception as e:
+            log(f"❌ Ошибка преобразования SKU: {e}")
+            return
+        
+        # Подготовка данных для записи - точно как в локальной версии
+        sheet_data = sheet_df[['Дата обновления', 'SKU']].copy()
+        sheet_data['row_index'] = sheet_data.index + 2  # Индексы строк в Google Таблице
+        sheet_data['rub'] = None
+        
+        matches_found = 0
+        for _, row in df.iterrows():
+            date = row['date']
+            sku = row['sku']
+            rub = row['rub']
+            match = sheet_data[
+                (sheet_data['Дата обновления'] == date) & 
+                (sheet_data['SKU'] == sku)
+            ]
+            if not match.empty:
+                sheet_data.loc[match.index, 'rub'] = rub
+                matches_found += 1
+        
+        log(f"🔍 Найдено совпадений: {matches_found}")
+        
+        # Массовая запись точно как в локальной версии
+        update_data = [[row['rub'] if row['rub'] is not None else ''] for _, row in sheet_data.iterrows()]
+        update_range = f'F2:F{len(sheet_data) + 1}'
+        
+        sheet.update(range_name=update_range, values=update_data)
+        log(f"✅ Записано в Google Таблицу: {matches_found} значений")
+        
+    except Exception as e:
+        log(f"❌ Ошибка записи в Google Таблицу: {e}")
+        raise
 
 
-def fetch_all_pages(
-    camp_chunk: tuple[str, ...],
-    date_from: str,
-    date_to: str,
-    token: str,
-    client_id: str,
-    client_secret: str,
-    debug_sku: str | None,
-) -> pd.DataFrame:
+# ──────────────────────────── run() ────────────────────────────
+def run(
+    *,
+    gs_cred: str,
+    spread_id: str,
+    sheet_main: str = "unit-day",
+    perf_client_id: str,
+    perf_client_secret: str,
+    days: int = 7,
+):
+    """Основная функция - максимально близко к локальной версии"""
+    log("🚀 Запуск p_campain_fin_1")
+    
+    session = requests.Session()
+    
+    # Получаем начальный токен
+    token, token_time = get_token(session, perf_client_id, perf_client_secret)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    # 1) create request
-    r = requests.post(
-        API_HOST + STATS_ENDP,
-        headers=headers,
-        json={
-            "campaigns": camp_chunk,
-            "dateFrom": date_from,
-            "dateTo": date_to,
-            "groupBy": "DATE",
-        },
-        timeout=TIMEOUT,
-    )
-    if r.status_code == 429:
-        raise RuntimeError("429 Too Many Requests (create stats)")
-    r.raise_for_status()
-    uuid = r.json()["UUID"]
-    log.info("uuid %s OK → wait", uuid)
-
-    # 2) wait
-    wait_uuid(uuid, headers)
-
-    # 3) download archive
-    rep = requests.get(
-        API_HOST + REPORT_ENDP,
-        headers=headers,
-        params={"UUID": uuid},
-        timeout=TIMEOUT,
-    )
-    rep.raise_for_status()
-    if "application/zip" not in rep.headers.get("Content-Type", ""):
-        raise RuntimeError(f"Report for {uuid} is not zip")
-    return parse_zip(rep.content, debug_sku)
-
-
-# ──────────────────── Google Sheets ────────────────────
-def write_sheet(df_total: pd.DataFrame,
-                gs_cred: str,
-                spread_id: str,
-                sheet_main: str):
-    if df_total.empty:
-        log.warning("No data to write")
-        return
-
-    creds = Credentials.from_service_account_file(
-        gs_cred,
-        scopes=[
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    ss = gspread.authorize(creds).open_by_key(spread_id)
-    ws = ss.worksheet(sheet_main)
-
-    # карта (дата, sku) → индекс строки
-    vals = ws.get_all_values()
-    header = vals[0]
-    idx_date = header.index("Дата обновления")
-    idx_sku  = header.index("SKU")
-    row_map  = {
-        (r[idx_date].split()[0], int(r[idx_sku])): i + 1
-        for i, r in enumerate(vals[1:], start=2)  # Google-строки начинаются с 1
-    }
-
-    updates = []
-    for date, sku, rub in df_total.itertuples(index=False):
-        key = (date.split(" ")[0], int(sku))
-        row = row_map.get(key)
-        if row:
-            updates.append([row, rub])
-
-    if not updates:
-        log.info("Nothing to update in sheet")
-        return
-
-    # формируем пачечный запрос к столбцу F
-    body = [
-        {"range": f"F{r}:F{r}", "values": [[v]]}
-        for r, v in updates
-    ]
-    # Google API ограничивает batchUpdate ~100 операций ⇒ режем
-    for chunk in grouper(body, 90):
-        ws.batch_update(chunk)
-    log.info("🟢 Записано %d ячеек", len(updates))
-
-
-# ──────────────────── ENTRYPOINT ────────────────────
-def run(*,
-        gs_cred: str,
-        spread_id: str,
-        perf_client_id: str,
-        perf_client_secret: str,
-        sheet_main: str = "unit-day",
-        days: int = 7):
-
-    debug_sku = os.getenv("DEBUG_SKU")
-
-    date_to   = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
-    date_from = (date_to - timedelta(days=days-1))
-
-    date_from_s = date_from.strftime("%Y-%m-%d")
-    date_to_s   = date_to.strftime("%Y-%m-%d")
-
-    token, ts = get_token(perf_client_id, perf_client_secret)
-
-    # 1) список кампаний
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    r = requests.get(f"{API_HOST}{STATS_ENDP.replace('/statistics','/campaign')}",
-                     headers=headers, timeout=TIMEOUT)
-    r.raise_for_status()
-    camps = [
-        str(it["id"]) for it in r.json().get("list", [])
-        if it.get("state") in {
-            "CAMPAIGN_STATE_RUNNING",
-            "CAMPAIGN_STATE_STOPPED",
-            "CAMPAIGN_STATE_INACTIVE",
-        }
-    ]
-    log.info("campaigns: %s", camps)
-
-    df_total = pd.DataFrame(columns=["date", "sku", "rub"])
-
-    # 2) цикл по чанкам кампаний
-    for chunk in grouper(camps, CHUNK_SIZE):
-        try:
-            token, ts = refresh_if_needed(token, ts,
-                                          perf_client_id, perf_client_secret)
-            part = fetch_all_pages(chunk, date_from_s, date_to_s,
-                                   token, perf_client_id, perf_client_secret,
-                                   debug_sku)
-            df_total = pd.concat([df_total, part], ignore_index=True)
-        except requests.HTTPError as e:
-            if e.response.status_code == 429:
-                log.warning("429 on chunk %s; sleep %s sec", chunk, WAIT_SEC*2)
-                time.sleep(WAIT_SEC * 2)
+    
+    # Функции для работы с токеном
+    def update_headers(new_headers: dict):
+        headers.update(new_headers)
+    
+    def get_headers() -> dict:
+        return headers.copy()
+    
+    def refresh_token():
+        nonlocal token_time
+        token_time = ensure_token(session, token_time, perf_client_id, perf_client_secret, update_headers)
+    
+    try:
+        # 1. Получаем кампании
+        campaign_ids = fetch_campaigns(session, get_headers())
+        if not campaign_ids:
+            log("❌ Нет активных кампаний")
+            return
+        
+        # 2. Формируем даты (точно как в локальной версии)
+        now_utc = datetime.now(timezone.utc)
+        msk_offset = timedelta(hours=3)
+        now_msk = now_utc + msk_offset
+        date_to = now_msk.date()
+        date_from = (now_msk - timedelta(days=days)).date()
+        date_from_str = date_from.strftime("%Y-%m-%d")
+        date_to_str = date_to.strftime("%Y-%m-%d")
+        
+        log(f"📅 Период: {date_from_str} - {date_to_str}")
+        
+        # 3. Собираем UUID для каждого чанка кампаний
+        uuids = []
+        for chunk_campaigns in chunk(campaign_ids, 10):  # 10 кампаний в чанке как в локальной версии
+            try:
+                # Проверяем токен перед запросом
+                refresh_token()
+                
+                uuid = post_statistics(session, get_headers(), chunk_campaigns, date_from_str, date_to_str)
+                
+                # Ждём готовности UUID
+                wait_uuid(session, uuid, get_headers, refresh_token)
+                
+                uuids.append(uuid)
+                log(f"✅ UUID {uuid} готов к скачиванию")
+                
+            except Exception as e:
+                log(f"❌ Ошибка обработки чанка кампаний {chunk_campaigns}: {e}")
                 continue
-            raise
-
-    # 3) агрегация и запись
-    if not df_total.empty:
-        df_total = (
-            df_total.groupby(["date", "sku"], as_index=False)["rub"]
-            .sum()
-            .round(2)
-        )
-    write_sheet(df_total, gs_cred, spread_id, sheet_main)
-    log.info("✅ p_campain_fin_1 DONE")
-
-
-# тесты локально:
-# if __name__ == "__main__":
-#     run(gs_cred="cred.json",
-#         spread_id="1xxx",
-#         perf_client_id="xxx",
-#         perf_client_secret="xxx")
+        
+        if not uuids:
+            log("❌ Не получено ни одного UUID")
+            return
+        
+        log(f"📊 Всего UUID для скачивания: {len(uuids)}")
+        
+        # 4. Скачиваем и обрабатываем все ZIP файлы
+        all_dataframes = []
+        for uuid in uuids:
+            try:
+                refresh_token()  # Обновляем токен перед каждым скачиванием
+                zip_data = download_zip(session, get_headers(), uuid)
+                df = parse_zip(zip_data)
+                if not df.empty:
+                    all_dataframes.append(df)
+                    log(f"✅ UUID {uuid}: получено {len(df)} строк")
+                else:
+                    log(f"⚠️ UUID {uuid}: нет данных")
+            except Exception as e:
+                log(f"❌ Ошибка обработки UUID {uuid}: {e}")
+                continue
+        
+        if not all_dataframes:
+            log("❌ Нет данных для записи")
+            return
+        
+        # 5. Объединяем все данные
+        final_df = pd.concat(all_dataframes, ignore_index=True)
+        
+        # Финальная группировка по дате и SKU
+        final_df = final_df.groupby(['date', 'sku'], as_index=False)['rub'].sum()
+        
+        log(f"📊 Итого строк для записи: {len(final_df)}")
+        log(f"💰 Общая сумма расходов: {final_df['rub'].sum():.2f} ₽")
+        
+        # 6. Записываем в Google Sheets
+        write_sheet(gs_cred, spread_id, sheet_main, final_df)
+        
+        log("✅ p_campain_fin_1 успешно завершён")
+        
+    except Exception as e:
+        log(f"❌ Критическая ошибка: {e}")
+        raise
