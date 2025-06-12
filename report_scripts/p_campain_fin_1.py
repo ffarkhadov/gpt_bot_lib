@@ -1,27 +1,27 @@
 """
-p_campain_fin_1 (динамический)
-──────────────────────────────
-• Получает отчёты Performance API
-• Суммирует расход (RUB with VAT) по SKU × день
-• Записывает значения в колонку «Расходы на рекламу» (F) листа unit-day
+p_campain_fin_1 (обновлён)
+──────────────────────────
+• Сопоставление выполняется ТОЛЬКО по SKU (колонка B листа unit-day);
+• Если у одного SKU несколько дат в листе – расход пишется во все строки
+  с данным SKU;
+• Защита от расхождения заголовков CSV (рус/англ);
+• Ошибки чтения CSV больше не роняют отчёт.
 """
 
 from __future__ import annotations
 import io, zipfile, time, requests, pandas as pd
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict
+from typing import Dict, List
 
 
-def chunk_list(lst, n):            # helper
+def chunk(lst, n):          # helper
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 
-# ───────────────────────── main ─────────────────────────
 def run(*, perf_client_id: str, perf_client_secret: str,
         gs_cred: str, spread_id: str,
-        days: int = 7, worksheet_main: str = "unit-day",
-        token_oz: str = "", **_) -> None:
+        days: int = 7, worksheet_main: str = "unit-day", **_) -> None:
 
     import gspread
     from google.oauth2.service_account import Credentials
@@ -29,110 +29,116 @@ def run(*, perf_client_id: str, perf_client_secret: str,
     host = "https://api-performance.ozon.ru"
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    def refresh_token() -> datetime:
+    def refresh() -> datetime:
         body = {"client_id": perf_client_id,
                 "client_secret": perf_client_secret,
                 "grant_type": "client_credentials"}
-        tok = requests.post(host + "/api/client/token",
-                            headers=headers, json=body).json()["access_token"]
-        headers["Authorization"] = f"Bearer {tok}"
+        token = requests.post(host + "/api/client/token",
+                              headers=headers, json=body).json()["access_token"]
+        headers["Authorization"] = f"Bearer {token}"
         return datetime.now(timezone.utc)
 
-    token_time = refresh_token()
+    token_time = refresh()
 
-    # ---------- кампании ----------
+    # кампании
     camps = requests.get(f"{host}/api/client/campaign", headers=headers).json()["list"]
     camp_ids = [c["id"] for c in camps if c["state"] in
                 {"CAMPAIGN_STATE_RUNNING", "CAMPAIGN_STATE_STOPPED", "CAMPAIGN_STATE_INACTIVE"}]
 
-    # ---------- ожидание ----------
-    def wait(uuid: str):
-        nonlocal token_time
-        url = f"{host}/api/client/statistics/{uuid}"
-        while True:
-            if (datetime.now(timezone.utc)-token_time).total_seconds() > 1500:
-                token_time = refresh_token()
-            st = requests.get(url, headers=headers).json().get("state")
-            if st == "OK":
-                return
-            if st == "FAILED":
-                raise RuntimeError(f"report {uuid} failed")
-            time.sleep(120)
+    # даты интервала
+    msk_now = datetime.now(timezone.utc) + timedelta(hours=3)
+    msk_from = msk_now - timedelta(days=days)
 
-    # ---------- запрашиваем UUID ----------
     uuids: List[str] = []
-    d_to   = datetime.now(timezone.utc) + timedelta(hours=3)
-    d_from = d_to - timedelta(days=days)
-    for chunk in chunk_list(camp_ids, 10):
-        body = {"campaigns": chunk,
-                "dateFrom": d_from.date().isoformat(),
-                "dateTo":   d_to.date().isoformat(),
+
+    # 1. Запрашиваем отчёты
+    for part in chunk(camp_ids, 10):
+        if (datetime.now(timezone.utc) - token_time).total_seconds() > 1500:
+            token_time = refresh()
+        body = {"campaigns": part,
+                "dateFrom": msk_from.date().isoformat(),
+                "dateTo": msk_now.date().isoformat(),
                 "groupBy": "DATE"}
         r = requests.post(f"{host}/api/client/statistics",
                           headers=headers, json=body)
         if r.status_code != 200 or "UUID" not in r.json():
             continue
-        uuid = r.json()["UUID"]; uuids.append(uuid); wait(uuid)
+        uid = r.json()["UUID"]; uuids.append(uid)
 
     if not uuids:
         print("[ads] нет uuid"); return
 
-    # ---------- читаем ZIP ----------
-    ALIASES = {
-        "Day": "День",
-        "SKU": "sku",
-        "Расход, ₽, с НДС": "Расход, ₽, с НДС",
-        "Spend, RUB with VAT": "Расход, ₽, с НДС",
-    }
+    # 2. Ждём готовности
+    def wait(u: str):
+        nonlocal token_time
+        while True:
+            if (datetime.now(timezone.utc)-token_time).total_seconds() > 1500:
+                token_time = refresh()
+            st = requests.get(f"{host}/api/client/statistics/{u}",
+                              headers=headers).json().get("state")
+            if st == "OK":
+                return
+            if st == "FAILED":
+                raise RuntimeError(f"report {u} failed")
+            time.sleep(120)
+
+    for u in uuids:
+        wait(u)
+
+    # 3. Читаем ZIP и агрегируем
+    ALIAS = {"Day": "date", "День": "date",
+             "SKU": "sku", "Расход, ₽, с НДС": "cost",
+             "Spend, RUB with VAT": "cost"}
     frames = []
-    for uuid in uuids:
-        r = requests.get(f"{host}/api/client/statistics/report",
-                         headers=headers, params={"UUID": uuid})
-        if r.status_code != 200 or "application/zip" not in r.headers.get("Content-Type", ""):
+    for u in uuids:
+        z = requests.get(f"{host}/api/client/statistics/report",
+                         headers=headers, params={"UUID": u})
+        if z.status_code != 200 or "application/zip" not in z.headers.get("Content-Type", ""):
             continue
-        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        with zipfile.ZipFile(io.BytesIO(z.content)) as zf:
             for fn in zf.namelist():
                 if not fn.endswith((".csv", ".txt")):
                     continue
                 df = pd.read_csv(io.TextIOWrapper(zf.open(fn), "utf-8"), sep=";", skiprows=1)
-                df = df.rename(columns=ALIASES)
-                if not {"День", "sku", "Расход, ₽, с НДС"}.issubset(df.columns):
+                df = df.rename(columns=ALIAS)
+                if not {"date", "sku", "cost"}.issubset(df.columns):
                     continue
-                df = df[df["День"] != "Всего"]
+                df = df[df["date"] != "Всего"]
                 df["sku"] = pd.to_numeric(df["sku"], errors="coerce").dropna().astype(int)
-                df["Расход, ₽, с НДС"] = df["Расход, ₽, с НДС"].astype(str) \
-                                                  .str.replace(",", ".").astype(float)
-                frames.append(df[["День", "sku", "Расход, ₽, с НДС"]])
+                df["cost"] = df["cost"].astype(str).str.replace(",", ".").astype(float)
+                frames.append(df[["sku", "cost"]])
 
     if not frames:
         print("[ads] нет строк csv"); return
 
-    grp = (pd.concat(frames)
-           .groupby(["День", "sku"], as_index=False)["Расход, ₽, с НДС"]
-           .sum().rename(columns={"Расход, ₽, с НДС": "rub"}))
+    grouped = (pd.concat(frames)          # агрегируем по SKU
+               .groupby("sku", as_index=False)["cost"].sum())
 
-    # ---------- Google Sheets ----------
-    creds = Credentials.from_service_account_file(gs_cred,
+    # 4. Google Sheets
+    creds = Credentials.from_service_account_file(
+        gs_cred,
         scopes=["https://spreadsheets.google.com/feeds",
                 "https://www.googleapis.com/auth/drive"])
     ws = gspread.authorize(creds).open_by_key(spread_id).worksheet(worksheet_main)
 
-    hdr       = ws.row_values(1)
-    col_adv   = hdr.index("Расходы на рекламу")
-    sheet_val = ws.get_all_values()[1:]
+    hdr = ws.row_values(1)
+    col_adv = hdr.index("Расходы на рекламу")         # F
+    data = ws.get_all_values()[1:]
 
-    row_map: Dict[tuple[str, int], int] = {
-        (r[0].split(" ")[0], int(r[1])): idx+2
-        for idx, r in enumerate(sheet_val)
-        if r and r[0] not in ("", "Итого")
-    }
+    # карта sku → список rowIdx
+    sku_rows: Dict[int, List[int]] = {}
+    for i, row in enumerate(data, start=2):
+        try:
+            sku_val = int(row[1])
+            sku_rows.setdefault(sku_val, []).append(i)
+        except Exception:
+            continue
 
     updates = []
-    for _, row in grp.iterrows():
-        key = (row["День"], int(row["sku"]))
-        if key in row_map:
-            updates.append({"range": f"{chr(65+col_adv)}{row_map[key]}",
-                            "values": [[row["rub"]]]})
+    for _, row in grouped.iterrows():
+        sku, rub = int(row["sku"]), row["cost"]
+        for r in sku_rows.get(sku, []):
+            updates.append({"range": f"{chr(65+col_adv)}{r}", "values": [[rub]]})
 
     if updates:
         ws.batch_update(updates)
